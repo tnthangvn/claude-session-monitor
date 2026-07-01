@@ -1,0 +1,9 @@
+tests/
+docs/
+coverage/
+.env
+.eslintrc.json
+.prettierrc
+jest.config.js
+PLAN.md
+*.log
