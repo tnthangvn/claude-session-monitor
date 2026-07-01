@@ -14,6 +14,7 @@ const { execFileSync } = require('child_process');
 
 const TMP_HOME = path.join(os.tmpdir(), `csm-cli-${process.pid}-${Date.now()}`);
 const CLI_PATH = path.join(__dirname, '..', 'bin', 'cli.js');
+const PKG_VERSION = require('../package.json').version;
 
 const ENV = { ...process.env, HOME: TMP_HOME, USERPROFILE: TMP_HOME };
 
@@ -36,7 +37,7 @@ afterAll(() => {
 describe('claude-session-monitor CLI', () => {
   test('--version prints the package version', () => {
     const out = runCli(['--version']);
-    expect(out.trim()).toBe('1.0.0');
+    expect(out.trim()).toBe(PKG_VERSION);
   });
 
   test('--help lists all five commands', () => {
