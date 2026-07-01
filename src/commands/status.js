@@ -1,22 +1,13 @@
 'use strict';
 
 const fs = require('fs');
-const os = require('os');
 const chalk = require('chalk');
 
 const config = require('../services/config');
 const generator = require('../services/generator');
 const claudeSettings = require('../services/claudeSettings');
+const telegramState = require('../services/telegramState');
 const { maskToken, formatDuration, formatTimestamp } = require('../utils/formatters');
-
-/**
- * Resolve the current user's session lock file path.
- * @returns {string}
- */
-function lockFilePath() {
-  const user = process.env.USER || os.userInfo().username;
-  return `/tmp/claude-session-${user}.lock`;
-}
 
 /**
  * Print a two-column labelled row.
@@ -24,7 +15,7 @@ function lockFilePath() {
  * @param {string} value
  */
 function row(label, value) {
-  console.log(`  ${chalk.bold(label.padEnd(14))} ${value}`);
+  console.log(`  ${chalk.bold(label.padEnd(16))} ${value}`);
 }
 
 /**
@@ -45,124 +36,80 @@ function printConfig(cfg) {
   row('Bot token', maskToken(cfg.botToken));
   row('Group ID', String(cfg.groupId));
   row('Timeout', `${cfg.timeout}s`);
-  row('Approval mode', cfg.approvalMode ? chalk.green('on') : chalk.dim('off'));
   row('Machine', cfg.machineName);
   row('Installed', formatTimestamp(cfg.installedAt));
+  row(
+    'State message',
+    cfg.stateMessageId ? String(cfg.stateMessageId) : chalk.dim('not created yet')
+  );
 }
 
 /**
- * Render the hook health block.
+ * Render the hook-health block for the account-lock runtime.
  */
 function printHookHealth() {
   section('Hook health');
-  const registered = claudeSettings.hasHook();
-  const scriptExists = fs.existsSync(generator.HOOK_PATH);
+  const registered = claudeSettings.hasHooks();
+  const runnerExists = fs.existsSync(generator.RUNNER_PATH);
   row(
-    'Settings hook',
+    'Settings hooks',
     registered ? chalk.green('✓ registered') : chalk.red('✗ not registered')
   );
   row(
-    'Hook script',
-    scriptExists
-      ? chalk.green(`✓ ${generator.HOOK_PATH}`)
-      : chalk.red(`✗ missing (${generator.HOOK_PATH})`)
+    'Runtime',
+    runnerExists
+      ? chalk.green(`✓ ${generator.RUNNER_PATH}`)
+      : chalk.red(`✗ missing (${generator.RUNNER_PATH})`)
   );
 }
 
 /**
- * Parse a lock file's contents into { machine, ts }.
- * Supports "machine epoch" and JSON forms defensively.
- * @param {string} raw
- * @returns {{ machine: string, ts: number }|null}
+ * Render one active-account row from the shared state.
+ * @param {string} account
+ * @param {object} info { machine, ip, loc, ts }
+ * @param {number} nowSeconds
  */
-function parseLock(raw) {
-  const trimmed = (raw || '').trim();
-  if (!trimmed) return null;
+function printAccountRow(account, info, nowSeconds) {
+  const machine = info.machine || 'unknown';
+  const where = [info.ip, info.loc].filter(Boolean).join(' · ') || chalk.dim('unknown');
+  const ts = Number(info.ts);
+  const age = Number.isFinite(ts) ? formatDuration(nowSeconds - ts) : chalk.dim('unknown');
 
-  try {
-    const parsed = JSON.parse(trimmed);
-    if (parsed && typeof parsed === 'object') {
-      const ts = Number(parsed.ts || parsed.epoch || parsed.time);
-      return { machine: parsed.machine || 'unknown', ts: Number.isFinite(ts) ? ts : NaN };
-    }
-  } catch (err) {
-    // Not JSON — fall through to whitespace parsing.
-  }
-
-  const parts = trimmed.split(/\s+/);
-  const machine = parts[0] || 'unknown';
-  const ts = Number(parts[1]);
-  return { machine, ts };
+  console.log(`  ${chalk.bold(account)}`);
+  row('  Machine', machine);
+  row('  Location', where);
+  row('  Active for', age);
 }
 
 /**
- * Render the active-session block from the lock file.
+ * Render the shared account-lock state (a table of active accounts).
  * @param {object} cfg
  */
-function printActiveSession(cfg) {
-  section('Active session');
-  const lockPath = lockFilePath();
+async function printSharedState(cfg) {
+  section('Shared lock state');
 
-  if (!fs.existsSync(lockPath)) {
-    console.log(chalk.dim('  None — no active session lock found.'));
-    return;
-  }
-
-  let raw = '';
+  let result;
   try {
-    raw = fs.readFileSync(lockPath, 'utf8');
+    result = await telegramState.readState(cfg);
   } catch (err) {
-    console.log(chalk.yellow(`  Lock file present but unreadable: ${err.message}`));
+    const message = err && err.message ? err.message : String(err);
+    console.log(chalk.yellow(`  Could not read shared state: ${message}`));
     return;
   }
 
-  const parsed = parseLock(raw);
-  if (!parsed) {
-    console.log(chalk.yellow('  Lock file present but empty or malformed.'));
+  const accounts = (result && result.state && result.state.accounts) || {};
+  const keys = Object.keys(accounts);
+  if (keys.length === 0) {
+    console.log(chalk.dim('  No active sessions.'));
     return;
   }
 
-  row('Locked by', parsed.machine);
-
-  if (!Number.isFinite(parsed.ts)) {
-    row('Elapsed', chalk.dim('unknown (no timestamp in lock)'));
-    return;
-  }
-
-  // Lock timestamps are epoch seconds; formatDuration expects milliseconds.
-  const elapsedMs = Date.now() - parsed.ts * 1000;
-  const withinTimeout = elapsedMs <= cfg.timeout * 1000;
-  row('Elapsed', formatDuration(elapsedMs));
-  row(
-    'Status',
-    withinTimeout ? chalk.green('within timeout') : chalk.red('expired (past timeout)')
-  );
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  keys.forEach((account) => printAccountRow(account, accounts[account] || {}, nowSeconds));
 }
 
 /**
- * Render the recent-history block.
- */
-function printRecentHistory() {
-  section('Recent history');
-  const rows = config.readHistory(5);
-  if (!rows || rows.length === 0) {
-    console.log(chalk.dim('  No session history yet.'));
-    return;
-  }
-  rows.forEach((entry) => {
-    const when = formatTimestamp(entry.ts);
-    const event = entry.event === 'START'
-      ? chalk.green(entry.event)
-      : entry.event === 'CONFLICT'
-        ? chalk.red(entry.event)
-        : chalk.dim(entry.event);
-    const detail = entry.detail ? chalk.dim(`— ${entry.detail}`) : '';
-    console.log(`  ${chalk.dim(when)}  ${event}  ${entry.machine} ${detail}`.trimEnd());
-  });
-}
-
-/**
- * Show configuration, hook health, active session, and recent history.
+ * Show configuration, hook health, and the shared account-lock state.
  */
 async function status() {
   if (!config.configExists()) {
@@ -182,8 +129,7 @@ async function status() {
 
   printConfig(cfg);
   printHookHealth();
-  printActiveSession(cfg);
-  printRecentHistory();
+  await printSharedState(cfg);
   console.log('');
 }
 

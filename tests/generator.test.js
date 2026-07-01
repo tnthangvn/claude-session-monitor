@@ -1,99 +1,111 @@
 'use strict';
 
 /**
- * Unit tests for src/services/generator.js.
- * HOME is redirected before the module is required so HOOK_DIR / HOOK_PATH and
- * the embedded HISTORY_PATH all resolve into an isolated temp directory.
+ * Unit tests for src/services/generator.js (self-contained runtime installer).
+ *
+ * os.homedir() is spied BEFORE requiring the module so RUNTIME_DIR / RUNNER_PATH
+ * / HOOK_DIR all resolve into an isolated temp directory. Jest ignores $HOME
+ * under its sandbox, so spying os.homedir() is the reliable isolation seam.
  */
 
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
 
-const TMP_HOME = path.join(os.tmpdir(), `csm-generator-${process.pid}-${Date.now()}`);
+const TMP_HOME = path.join(os.tmpdir(), `csm-gen-${process.pid}-${Date.now()}`);
 fs.mkdirSync(path.join(TMP_HOME, '.claude'), { recursive: true });
 
-// os.homedir() ignores $HOME under Jest's sandbox, so spy it BEFORE requiring the
-// module — generator.js captures HOOK_DIR/HOOK_PATH/HISTORY_PATH from os.homedir()
-// at load time.
 jest.spyOn(os, 'homedir').mockReturnValue(TMP_HOME);
 
 const generator = require('../src/services/generator');
 
 // HARD GUARD: never allow writes to the real home.
-if (!generator.HOOK_DIR.startsWith(os.tmpdir())) {
-  throw new Error(`ISOLATION FAILED: ${generator.HOOK_DIR} is not under tmpdir`);
+if (!generator.RUNNER_PATH.startsWith(os.tmpdir())) {
+  throw new Error(`ISOLATION FAILED: ${generator.RUNNER_PATH} is not under tmpdir`);
 }
 
-const sampleConfig = {
-  botToken: '123456789:SECRET-TOKEN-VALUE',
-  groupId: '-1001234567890',
-  timeout: 450,
+// Source runtime shipped with the package — installed copies must be identical.
+const SOURCE_RUNNER = path.join(__dirname, '..', 'src', 'hooks', 'runner.js');
+
+const EVENT_ARGS = {
+  SessionStart: 'sessionstart',
+  PreToolUse: 'pretooluse',
+  SessionEnd: 'sessionend',
 };
 
+const mode = (p) => fs.statSync(p).mode & 0o777;
+
 beforeEach(() => {
-  generator.removeHookScript();
+  generator.removeRuntime();
 });
 
 afterAll(() => {
   fs.rmSync(TMP_HOME, { recursive: true, force: true });
 });
 
-describe('generateHookScript', () => {
-  test('leaves no unresolved {{...}} placeholders', () => {
-    const script = generator.generateHookScript(sampleConfig);
-    expect(script).not.toMatch(/\{\{[^}]+\}\}/);
+describe('installRuntime', () => {
+  test('writes runner.js at RUNNER_PATH with mode 0755', () => {
+    const result = generator.installRuntime();
+
+    expect(result.runnerPath).toBe(generator.RUNNER_PATH);
+    expect(fs.existsSync(generator.RUNNER_PATH)).toBe(true);
+    expect(mode(generator.RUNNER_PATH)).toBe(0o755);
   });
 
-  test('embeds the bot token, group id and timeout', () => {
-    const script = generator.generateHookScript(sampleConfig);
-    expect(script).toContain('BOT_TOKEN="123456789:SECRET-TOKEN-VALUE"');
-    expect(script).toContain('GROUP_ID="-1001234567890"');
-    expect(script).toContain('TIMEOUT="450"');
+  test('writes all three wrappers with mode 0755', () => {
+    const { wrappers } = generator.installRuntime();
+
+    for (const key of Object.keys(EVENT_ARGS)) {
+      const wrapperPath = wrappers[key];
+      expect(fs.existsSync(wrapperPath)).toBe(true);
+      expect(mode(wrapperPath)).toBe(0o755);
+    }
   });
 
-  test('embeds the isolated history log path', () => {
-    const script = generator.generateHookScript(sampleConfig);
-    expect(script).toContain(path.join(TMP_HOME, '.claude', 'session-monitor', 'history.log'));
-  });
-});
+  test('each wrapper bakes the absolute RUNNER_PATH, correct event arg, and node guard', () => {
+    generator.installRuntime();
 
-describe('installHookScript', () => {
-  test('writes the script to HOOK_PATH and returns that path', () => {
-    // Act
-    const result = generator.installHookScript(sampleConfig);
-
-    // Assert
-    expect(result).toBe(generator.HOOK_PATH);
-    expect(fs.existsSync(generator.HOOK_PATH)).toBe(true);
+    for (const [key, arg] of Object.entries(EVENT_ARGS)) {
+      const content = fs.readFileSync(generator.WRAPPERS[key], 'utf8');
+      expect(content).toContain(generator.RUNNER_PATH);
+      expect(content).toContain(`exec node "${generator.RUNNER_PATH}" ${arg}`);
+      expect(content).toContain('command -v node >/dev/null 2>&1 || exit 0');
+    }
   });
 
-  test('creates HOOK_DIR when it does not exist', () => {
-    generator.installHookScript(sampleConfig);
-    expect(fs.existsSync(generator.HOOK_DIR)).toBe(true);
-  });
-
-  test('written content matches generateHookScript output', () => {
-    generator.installHookScript(sampleConfig);
-    const onDisk = fs.readFileSync(generator.HOOK_PATH, 'utf8');
-    expect(onDisk).toBe(generator.generateHookScript(sampleConfig));
-  });
-
-  test('marks the script executable with mode 0755', () => {
-    generator.installHookScript(sampleConfig);
-    const mode = fs.statSync(generator.HOOK_PATH).mode & 0o777;
-    expect(mode).toBe(0o755);
+  test('the copied runner.js is byte-identical to the source', () => {
+    generator.installRuntime();
+    const copied = fs.readFileSync(generator.RUNNER_PATH);
+    const source = fs.readFileSync(SOURCE_RUNNER);
+    expect(copied.equals(source)).toBe(true);
   });
 });
 
-describe('removeHookScript', () => {
-  test('returns true when a script was removed', () => {
-    generator.installHookScript(sampleConfig);
-    expect(generator.removeHookScript()).toBe(true);
-    expect(fs.existsSync(generator.HOOK_PATH)).toBe(false);
+describe('WRAPPERS map', () => {
+  test('points at the three files under HOOK_DIR', () => {
+    expect(generator.WRAPPERS.SessionStart).toBe(
+      path.join(generator.HOOK_DIR, 'csm-session-start.sh')
+    );
+    expect(generator.WRAPPERS.PreToolUse).toBe(
+      path.join(generator.HOOK_DIR, 'csm-pretooluse.sh')
+    );
+    expect(generator.WRAPPERS.SessionEnd).toBe(
+      path.join(generator.HOOK_DIR, 'csm-session-end.sh')
+    );
   });
+});
 
-  test('returns false when there is nothing to remove', () => {
-    expect(generator.removeHookScript()).toBe(false);
+describe('removeRuntime', () => {
+  test('deletes the runner and wrappers and returns true, then false', () => {
+    generator.installRuntime();
+
+    expect(generator.removeRuntime()).toBe(true);
+    expect(fs.existsSync(generator.RUNNER_PATH)).toBe(false);
+    for (const key of Object.keys(EVENT_ARGS)) {
+      expect(fs.existsSync(generator.WRAPPERS[key])).toBe(false);
+    }
+
+    // Nothing left to remove on the second call.
+    expect(generator.removeRuntime()).toBe(false);
   });
 });
