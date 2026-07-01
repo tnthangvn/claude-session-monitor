@@ -17,6 +17,7 @@ const {
   isValidTimeout,
   normalizeGroupId,
 } = require('../utils/validators');
+const { maskToken } = require('../utils/formatters');
 
 const CONFIG_VERSION = '1.0.0';
 const DEFAULT_TIMEOUT = 1800;
@@ -41,32 +42,22 @@ function row(label, value) {
 }
 
 /**
- * Ask whether to overwrite an existing configuration.
- * @returns {Promise<boolean>} true if the wizard should continue
+ * Collect setup answers, SKIPPING any value already present in `existing`
+ * (only missing values are prompted). Returns the merged, complete values.
+ * @param {object} existing values already saved in the current config
+ * @returns {Promise<object>} { botToken, groupId, timeout, installHook }
  */
-async function confirmOverwrite() {
-  console.log(chalk.yellow('⚠ A configuration already exists.'));
-  const { overwrite } = await inquirer.prompt([
-    {
-      type: 'confirm',
-      name: 'overwrite',
-      message: 'Overwrite the existing configuration?',
-      default: false,
-    },
-  ]);
-  return overwrite;
-}
+async function collectAnswers(existing = {}) {
+  const hasToken = isValidBotToken(existing.botToken);
+  const hasGroup = isValidGroupId(existing.groupId);
+  const hasTimeout = isValidTimeout(existing.timeout);
 
-/**
- * Collect setup answers from the user.
- * @returns {Promise<object>} the raw prompt answers
- */
-async function collectAnswers() {
-  return inquirer.prompt([
+  const answers = await inquirer.prompt([
     {
       type: 'input',
       name: 'botToken',
       message: 'Telegram bot token:',
+      when: () => !hasToken,
       validate: (value) =>
         isValidBotToken(value)
           ? true
@@ -76,6 +67,7 @@ async function collectAnswers() {
       type: 'input',
       name: 'groupId',
       message: 'Telegram group ID (a negative number, e.g. -1001234567890):',
+      when: () => !hasGroup,
       validate: (value) =>
         isValidGroupId(value)
           ? true
@@ -86,6 +78,7 @@ async function collectAnswers() {
       name: 'timeout',
       message: 'Session lock timeout in seconds:',
       default: DEFAULT_TIMEOUT,
+      when: () => !hasTimeout,
       validate: (value) =>
         isValidTimeout(value) ? true : 'Timeout must be a positive number of seconds.',
     },
@@ -96,6 +89,13 @@ async function collectAnswers() {
       default: true,
     },
   ]);
+
+  return {
+    botToken: hasToken ? existing.botToken : answers.botToken,
+    groupId: hasGroup ? existing.groupId : answers.groupId,
+    timeout: hasTimeout ? existing.timeout : answers.timeout,
+    installHook: answers.installHook,
+  };
 }
 
 /**
@@ -286,15 +286,27 @@ async function init(options = {}) {
 
   section('claude-session-monitor · setup');
 
+  // Reuse an existing config: skip prompts for values already saved, only ask
+  // for what is missing. `--force` re-prompts everything from scratch.
+  let existing = {};
   if (config.configExists() && !options.force) {
-    const proceed = await confirmOverwrite();
-    if (!proceed) {
-      console.log(chalk.yellow('Setup aborted. Existing configuration left untouched.'));
-      return;
+    try {
+      existing = config.loadConfig();
+      console.log(
+        chalk.dim('Existing config found — reusing saved values; only missing ones are asked.')
+      );
+      if (isValidBotToken(existing.botToken)) row('Bot token', maskToken(existing.botToken));
+      if (isValidGroupId(existing.groupId)) row('Group ID', String(existing.groupId));
+      if (isValidTimeout(existing.timeout)) row('Timeout', `${existing.timeout}s`);
+    } catch (err) {
+      console.log(
+        chalk.yellow(`⚠ Could not read existing config (${err.message}); starting fresh.`)
+      );
+      existing = {};
     }
   }
 
-  const answers = await collectAnswers();
+  const answers = await collectAnswers(existing);
 
   section('Verify connection');
   const testResult = await verifyConnection(answers.botToken, answers.groupId);

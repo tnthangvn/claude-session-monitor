@@ -319,26 +319,41 @@ describe('init command', () => {
     expect(telegramState.ensureStateMessage).not.toHaveBeenCalled();
   });
 
-  test('aborts when the user declines to overwrite an existing config', async () => {
-    // Arrange
+  test('reuses an existing config, skipping the token/group/timeout prompts', async () => {
+    // Arrange — a full config already exists; only installHook is prompted.
     config.saveConfig(sampleConfig());
-    inquirer.prompt.mockResolvedValueOnce({ overwrite: false });
+    inquirer.prompt.mockResolvedValue({ installHook: false });
+    telegram.testConnection.mockResolvedValue(goodConnection());
 
     // Act
     await init({});
 
-    // Assert
-    expect(output()).toContain('Setup aborted');
-    expect(inquirer.prompt).toHaveBeenCalledTimes(1);
-    expect(telegram.testConnection).not.toHaveBeenCalled();
+    // Assert — no overwrite prompt; reused values drive the connection test.
+    const out = output();
+    expect(out).toContain('Existing config found');
+    expect(telegram.testConnection).toHaveBeenCalledWith(PLAINTEXT_TOKEN, '-1001234567890');
+    expect(config.configExists()).toBe(true);
   });
 
-  test('continues after a confirmed overwrite, tolerating a notify failure', async () => {
-    // Arrange — first prompt confirms overwrite, second returns answers.
+  test('with --force, re-prompts for every value instead of reusing', async () => {
+    // Arrange — config exists, but --force ignores it and asks for everything.
+    config.saveConfig(sampleConfig({ groupId: '-1009999999999' }));
+    inquirer.prompt.mockResolvedValue(answers({ installHook: false }));
+    telegram.testConnection.mockResolvedValue(goodConnection());
+
+    // Act
+    await init({ force: true });
+
+    // Assert — the freshly-entered group id (not the saved one) is used.
+    const out = output();
+    expect(out).not.toContain('Existing config found');
+    expect(telegram.testConnection).toHaveBeenCalledWith(PLAINTEXT_TOKEN, '-1001234567890');
+  });
+
+  test('reuses config and continues, tolerating a notify failure', async () => {
+    // Arrange — config exists; hooks skipped; the confirmation message fails.
     config.saveConfig(sampleConfig());
-    inquirer.prompt
-      .mockResolvedValueOnce({ overwrite: true })
-      .mockResolvedValueOnce(answers({ installHook: false }));
+    inquirer.prompt.mockResolvedValue({ installHook: false });
     telegram.testConnection.mockResolvedValue(goodConnection());
     telegram.sendMessage.mockRejectedValue(new Error('network down'));
 
@@ -350,7 +365,6 @@ describe('init command', () => {
     expect(out).toContain('Skipped hook installation');
     expect(out).toContain('Could not send the confirmation message');
     expect(out).toContain('is set up');
-    expect(inquirer.prompt).toHaveBeenCalledTimes(2);
     expect(fs.existsSync(generator.RUNNER_PATH)).toBe(false);
   });
 });

@@ -119,14 +119,30 @@ async function createAndPin(config, text) {
 }
 
 /**
- * Ensure a pinned state message exists. Returns its message id.
- * Creates + pins an empty state if there is none. Surfaces a clear error when
- * the bot lacks admin/pin permission (the core requirement for shared state).
+ * Ensure a GENUINELY pinned state message exists. Returns its message id.
+ *
+ * Only a message actually returned by getChat.pinned_message counts — a stale
+ * config.stateMessageId is NOT trusted, because an unpinned message cannot be
+ * read back (the Bot API has no getMessage). When nothing is pinned, this
+ * creates + pins a fresh state message, which throws a clear "Pin Messages"
+ * error if the bot is not an Admin with pin rights (the core requirement).
  * @returns {Promise<number>}
  */
 async function ensureStateMessage(config) {
-  const { messageId } = await readState(config);
-  if (messageId) return messageId;
+  let res;
+  try {
+    res = await axios.get(apiUrl(config.botToken, 'getChat'), {
+      params: { chat_id: config.groupId },
+      timeout: REQUEST_TIMEOUT_MS,
+    });
+  } catch (err) {
+    throw friendlyError(err, 'Could not read the group (getChat failed)');
+  }
+  const pinned = res.data && res.data.result && res.data.result.pinned_message;
+  if (pinned && parseStateText(pinned.text)) {
+    return pinned.message_id;
+  }
+  // Nothing usable is pinned → create + pin one (throws if the bot can't pin).
   return createAndPin(config, stateText({ v: 1, accounts: {} }));
 }
 
