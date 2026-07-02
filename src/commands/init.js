@@ -192,15 +192,17 @@ async function setupSharedState(cfg) {
 }
 
 /**
- * Send a best-effort installation notification to the group.
+ * Send a best-effort installation/update notification to the group.
  * @param {object} cfg persisted configuration
+ * @param {boolean} isUpdate true when a config already existed (re-init/upgrade)
  */
-async function notifyInstalled(cfg) {
+async function notifyInstalled(cfg, isUpdate) {
+  const version = require('../../package.json').version;
+  const text = isUpdate
+    ? `🔄 claude-session-monitor updated on ${cfg.machineName} (v${version})`
+    : `✅ claude-session-monitor installed on ${cfg.machineName} (v${version})`;
   try {
-    await telegram.sendMessage(
-      cfg,
-      `✅ claude-session-monitor installed on ${cfg.machineName}`
-    );
+    await telegram.sendMessage(cfg, text);
   } catch (err) {
     const message = err && err.message ? err.message : String(err);
     console.log(chalk.yellow(`⚠ Could not send the confirmation message: ${message}`));
@@ -286,6 +288,10 @@ async function init(options = {}) {
 
   section('claude-session-monitor · setup');
 
+  // A pre-existing config means this run is an update, not a fresh install —
+  // the group notification says so instead of repeating "installed".
+  const isUpdate = config.configExists();
+
   // Reuse an existing config: skip prompts for values already saved, only ask
   // for what is missing. `--force` re-prompts everything from scratch.
   let existing = {};
@@ -352,9 +358,9 @@ async function init(options = {}) {
   }
 
   section('Notify group');
-  await notifyInstalled(cfg);
+  await notifyInstalled(cfg, isUpdate);
 
   printSummary(cfg, hookInstalled);
 }
 
-module.exports = { init };
+module.exports = { init, installHookArtifacts, notifyInstalled };

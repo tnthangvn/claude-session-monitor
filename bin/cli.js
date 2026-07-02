@@ -42,6 +42,12 @@ program
   .action(runner((options) => require('../src/commands/init').init(options)));
 
 program
+  .command('upgrade')
+  .alias('force-update')
+  .description('Re-install the runtime + hooks from the current package (keeps config)')
+  .action(runner(() => require('../src/commands/upgrade').upgrade()));
+
+program
   .command('status')
   .description('Show current configuration, hook health, and recent activity')
   .action(runner((options) => require('../src/commands/status').status(options)));
@@ -56,6 +62,14 @@ program
   .description('Show recent session history')
   .option('-n, --lines <n>', 'number of history entries to show', '20')
   .action(runner((options) => require('../src/commands/logs').logs(options)));
+
+program
+  .command('pin')
+  .description('Pin one message of data onto the group (edits the current pinned message in place)')
+  .argument('<text...>', 'the data line to pin, verbatim')
+  .option('--state', 'prepend the session-lock header so the hook reads it as shared state')
+  .option('--new', 'always send and pin a fresh message instead of editing the pinned one')
+  .action(runner((text, options) => require('../src/commands/pin').pin(text, options)));
 
 program
   .command('uninstall')

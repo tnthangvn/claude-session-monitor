@@ -5,9 +5,9 @@
  * runner.js — self-contained hook runtime for claude-session-monitor.
  *
  * Account-lock across machines using a PINNED Telegram message as the shared
- * state store. Uses Node built-ins ONLY (https, fs, os, path, crypto) so it can
- * be copied to ~/.claude/session-monitor/runner.js and run standalone WITHOUT
- * node_modules.
+ * state store. Uses Node built-ins ONLY (https, fs, os, path, crypto,
+ * child_process) so it can be copied to ~/.claude/session-monitor/runner.js
+ * and run standalone WITHOUT node_modules.
  *
  * Usage (called by thin bash hook wrappers, hook JSON on stdin):
  *   node runner.js sessionstart   # acquire lock or mark blocked; notify group
@@ -25,11 +25,13 @@ const os = require('os');
 const path = require('path');
 const https = require('https');
 const crypto = require('crypto');
+const { execSync } = require('child_process');
 
 const HOME = os.homedir();
 const CONFIG_DIR = path.join(HOME, '.claude', 'session-monitor');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
 const SECRET_PATH = path.join(CONFIG_DIR, '.secret');
+const HISTORY_PATH = path.join(CONFIG_DIR, 'history.log');
 const CLAUDE_JSON = path.join(HOME, '.claude.json');
 
 const STATE_HEADER = '🔒 Claude session locks (auto — do not edit)';
@@ -117,6 +119,21 @@ function getAccount() {
 }
 
 const getMachine = () => os.hostname();
+
+/**
+ * Whether the lock entry `cur` belongs to THIS machine: the hostname AND the
+ * public IP must both match. Hostnames collide in practice (two PCs both named
+ * "pc"), so a matching hostname with a DIFFERENT public IP is a different
+ * machine → conflict. The IP is only compared when BOTH sides know it: a
+ * failed/offline lookup on either side falls back to the hostname comparison
+ * rather than manufacturing a false conflict.
+ */
+function sameHolder(cur, machine, ip) {
+  if (!cur) return false;
+  if (cur.machine !== machine) return false;
+  if (cur.ip && ip && cur.ip !== ip) return false;
+  return true;
+}
 
 // --------------------------------------------------------------------------
 // network (best-effort; never throws)
@@ -302,6 +319,27 @@ async function readState(cfg) {
   return { state: { v: 1, accounts: {} }, messageId: cfg.stateMessageId || null };
 }
 
+/**
+ * Live (non-stale) sessions held by an account entry, as {sessionId: ts}.
+ * Migrates the legacy single `session` field and drops sessions whose last
+ * heartbeat is older than the ttl (crashed sessions that never sent SessionEnd).
+ */
+function liveSessions(cur, ttl) {
+  const out = {};
+  if (!cur) return out;
+  const src =
+    cur.sessions && typeof cur.sessions === 'object'
+      ? cur.sessions
+      : cur.session
+        ? { [cur.session]: Number(cur.ts) || 0 }
+        : {};
+  for (const id of Object.keys(src)) {
+    const ts = Number(src[id]) || 0;
+    if (nowSec() - ts < ttl) out[id] = ts;
+  }
+  return out;
+}
+
 async function writeState(cfg, state, messageId) {
   const text = stateText(state);
   if (messageId) {
@@ -363,6 +401,160 @@ function removeMarker(sessionId) {
 }
 
 // --------------------------------------------------------------------------
+// local history (tab-separated, same format as src/services/config.js so the
+// `logs` CLI command can read entries written by this standalone runner)
+// --------------------------------------------------------------------------
+function appendHistory(event, detail) {
+  try {
+    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    const safe = (v) =>
+      String(v === undefined || v === null ? '' : v).replace(/[\t\n\r]/g, ' ');
+    const line = `${new Date().toISOString()}\t${safe(event)}\t${safe(getMachine())}\t${safe(detail)}\n`;
+    fs.appendFileSync(HISTORY_PATH, line);
+  } catch (_e) {
+    /* best-effort */
+  }
+}
+
+// --------------------------------------------------------------------------
+// local Claude processes (conflict enforcement — kill the intruding machine's
+// own Claude sessions; the lock holder's machine is never touched)
+// --------------------------------------------------------------------------
+
+/**
+ * Parse `tasklist /FO CSV /NH` output into claude.exe PIDs, excluding this
+ * hook. Lines look like: "claude.exe","1234","Console","1","45,678 K".
+ * The no-match case is an INFO: sentence, which simply matches nothing.
+ * @param {string} csvText
+ * @returns {number[]}
+ */
+function parseTasklistPids(csvText) {
+  return String(csvText || '')
+    .split(/\r?\n/)
+    .map((line) => {
+      const m = /^"claude\.exe","(\d+)"/i.exec(line.trim());
+      return m ? parseInt(m[1], 10) : NaN;
+    })
+    .filter((n) => Number.isFinite(n) && n > 0 && n !== process.pid);
+}
+
+/**
+ * PIDs of every `claude` process owned by this user, excluding this hook.
+ * Per platform:
+ *   - win32:  `tasklist` filtered on IMAGENAME claude.exe (no /proc, no pgrep;
+ *             other users' processes just land in `failed` on EPERM at kill)
+ *   - linux:  /proc scan — /proc/<pid>/comm matched EXACTLY (a substring match
+ *             on cmdline would catch this very hook, its path contains
+ *             ".claude/"), filtered to this UID
+ *   - darwin/other unix (or unreadable /proc): `pgrep -x claude`
+ * @param {string} [procRoot] injectable for tests
+ */
+function listClaudePids(procRoot = '/proc') {
+  if (process.platform === 'win32') {
+    try {
+      const out = execSync('tasklist /FI "IMAGENAME eq claude.exe" /FO CSV /NH', {
+        encoding: 'utf8',
+        timeout: 5000,
+        windowsHide: true,
+      });
+      return parseTasklistPids(out);
+    } catch (_e) {
+      return [];
+    }
+  }
+  try {
+    const uid = typeof process.getuid === 'function' ? process.getuid() : -1;
+    const pids = [];
+    for (const entry of fs.readdirSync(procRoot)) {
+      if (!/^\d+$/.test(entry)) continue;
+      const pid = parseInt(entry, 10);
+      if (pid === process.pid) continue;
+      try {
+        const dir = path.join(procRoot, entry);
+        if (uid >= 0 && fs.statSync(dir).uid !== uid) continue;
+        const comm = fs.readFileSync(path.join(dir, 'comm'), 'utf8').trim();
+        if (comm === 'claude') pids.push(pid);
+      } catch (_e) {
+        /* process vanished / unreadable → skip */
+      }
+    }
+    return pids;
+  } catch (_e) {
+    try {
+      const out = execSync('pgrep -x claude', { encoding: 'utf8', timeout: 3000 });
+      return out
+        .split('\n')
+        .map((s) => parseInt(s.trim(), 10))
+        .filter((n) => Number.isFinite(n) && n > 0 && n !== process.pid);
+    } catch (_e2) {
+      return []; // pgrep absent or no match (exit 1) → nothing to kill
+    }
+  }
+}
+
+/**
+ * PID of the `claude` process that spawned THIS hook (the current interactive
+ * session), found by walking the parent chain until a comm of exactly
+ * "claude". Returns 0 when it can't be identified (non-Linux, /proc
+ * unreadable, or the hook wasn't launched by claude).
+ *
+ * Callers exclude this pid from the conflict SIGKILL: killing our own session's
+ * raw-mode TUI leaves the terminal wedged (it never restores cooked mode), so
+ * every relaunch re-wedges it — the reported hang. Enforcement for this very
+ * session is the 'blocked' marker (PreToolUse denies every tool call) instead.
+ * @param {string} [procRoot] injectable for tests
+ * @returns {number}
+ */
+function currentClaudePid(procRoot = '/proc') {
+  try {
+    let pid = process.pid;
+    for (let hops = 0; hops < 24 && pid > 1; hops++) {
+      const dir = path.join(procRoot, String(pid));
+      try {
+        if (fs.readFileSync(path.join(dir, 'comm'), 'utf8').trim() === 'claude') {
+          return pid;
+        }
+      } catch (_e) {
+        /* comm vanished/unreadable → keep walking up */
+      }
+      let ppid = 0;
+      try {
+        const m = /^PPid:\s*(\d+)/m.exec(fs.readFileSync(path.join(dir, 'status'), 'utf8'));
+        ppid = m ? parseInt(m[1], 10) : 0;
+      } catch (_e) {
+        break; // no status → can't walk further
+      }
+      if (!ppid || ppid === pid) break;
+      pid = ppid;
+    }
+  } catch (_e) {
+    /* fall through to 0 */
+  }
+  return 0;
+}
+
+/**
+ * SIGKILL each pid INDIVIDUALLY (never a process group: this hook must
+ * survive its parent's death as an orphan to send the Telegram report).
+ * On Windows Node maps SIGKILL to TerminateProcess — same force semantics.
+ * @param {number[]} pids
+ * @returns {{killed: number[], failed: number[]}}
+ */
+function killPids(pids) {
+  const killed = [];
+  const failed = [];
+  for (const pid of pids) {
+    try {
+      process.kill(pid, 'SIGKILL');
+      killed.push(pid);
+    } catch (_e) {
+      failed.push(pid);
+    }
+  }
+  return { killed, failed };
+}
+
+// --------------------------------------------------------------------------
 // stdin (hook JSON payload)
 // --------------------------------------------------------------------------
 function readStdin() {
@@ -394,50 +586,107 @@ async function onSessionStart(cfg, input) {
   const machine = getMachine();
   const sessionId = input.session_id || 'unknown';
 
+  // Resolved BEFORE the conflict check: the public IP is part of the holder
+  // identity (hostnames collide — two PCs both named "pc"). Cached on disk for
+  // 15 min, so this is usually instant.
+  const { ip, loc } = await resolveNetInfo();
+
   const { state, messageId } = await readState(cfg);
   const cur = state.accounts[account];
-  const active = cur && nowSec() - (Number(cur.ts) || 0) < cfg.ttl;
+  const age = nowSec() - (Number(cur && cur.ts) || 0);
+  const active = cur && age < cfg.ttl;
+  const ours = sameHolder(cur, machine, ip);
 
-  // Conflict: same account, held by a DIFFERENT machine, still active.
-  if (active && cur.machine !== machine) {
+  // A holder on a DIFFERENT machine (hostname OR public IP differs) is a LIVE
+  // conflict only while it has been seen recently (within TTL_FLOOR_SEC — long
+  // enough to cover a slow tool call). Past that, but still inside the
+  // configured ttl, the holder is treated as stale/dead: rather than SIGKILL
+  // this machine on every launch (which left it "stuck stale" for up to the
+  // full ttl and unable to re-enter Claude), we re-check the pinned state and
+  // take the lock over here.
+  const liveConflict = active && !ours && age < TTL_FLOOR_SEC;
+
+  // Conflict: same account, held by a DIFFERENT machine, still fresh.
+  // Policy: the lock holder is untouchable (state is READ-ONLY here) — this
+  // machine kills its own Claude processes instead. Kill first, notify after,
+  // so the Telegram report carries the real outcome; SIGKILL targets
+  // individual pids, so this hook survives its parent's death as an orphan.
+  if (liveConflict) {
+    // This session is enforced by the marker (PreToolUse denies every tool
+    // call). We additionally SIGKILL OTHER local claude sessions, but NEVER our
+    // own TUI — killing its raw-mode terminal wedges the shell and every
+    // relaunch re-wedges it. If our own claude can't be identified, kill
+    // nothing and rely solely on the marker.
     writeMarker(sessionId, 'blocked');
+    const myClaude = currentClaudePid();
+    const { killed, failed } = myClaude
+      ? killPids(listClaudePids().filter((p) => p !== myClaude))
+      : { killed: [], failed: [] };
+    appendHistory(
+      'CONFLICT',
+      `holder=${cur.machine}/${cur.ip || '?'}, killed=${killed.length}, failed=${failed.length}`
+    );
     await notify(
       cfg,
-      `⚠️ <b>Session bị chặn</b>\n` +
+      `⛔ <b>Conflict</b>\n` +
         `Account <b>${esc(account)}</b> đang được dùng ở <b>${esc(cur.machine)}</b>` +
         ` (${esc(cur.ip || '?')}${cur.loc ? ' · ' + esc(cur.loc) : ''}).\n` +
-        `Máy <b>${esc(machine)}</b> vừa mở Claude → <b>không được vào</b> (mọi tool bị chặn).`
+        `Máy <b>${esc(machine)}</b> (${esc(ip || '?')}) vừa mở Claude → phiên này đã bị chặn (mọi tool call bị từ chối)` +
+        (killed.length ? ` + đã kill <b>${killed.length}</b> phiên Claude khác tại đây` : '') +
+        (failed.length ? ` (<b>${failed.length}</b> kill fail)` : '') +
+        `.`
     );
-    // Tell Claude (context) so it can explain to the user.
+    // This session survives (its own claude is spared to keep the terminal
+    // usable) but is blocked: surface why so Claude can tell the user.
     process.stdout.write(
       JSON.stringify({
         hookSpecificOutput: {
           hookEventName: 'SessionStart',
           additionalContext:
-            `claude-session-monitor: account ${account} is already active on ${cur.machine}. ` +
-            `This session is BLOCKED — every tool call will be denied until the other session ends.`,
+            `claude-session-monitor: account ${account} is already active on ${cur.machine} (${cur.ip || 'unknown ip'}). ` +
+            `This session is blocked — every tool call will be denied until that session ends. ` +
+            `${killed.length} other local Claude session(s) were sent SIGKILL.`,
         },
       })
     );
     return 0; // SessionStart cannot hard-block; PreToolUse enforces via the marker.
   }
 
-  // Free (or same machine) → acquire the lock.
-  const { ip, loc } = await resolveNetInfo();
+  // Taking over a stale lock left by a DIFFERENT machine: don't inherit its
+  // sessions, and announce the takeover so the group sees the machine change.
+  const staleHolder = active && !ours ? cur.machine : null;
+  if (staleHolder) {
+    appendHistory('TAKEOVER', `stale holder=${staleHolder}/${cur.ip || '?'}, age=${age}s`);
+  }
+
+  // Free (or same machine) → acquire or join the lock. The lock is
+  // reference-counted per session: only the FIRST session notifies; extra
+  // sessions on the same machine just register silently. A stale holder on
+  // another machine is dropped (its sessions are not carried over).
+  const sessions = liveSessions(active && ours ? cur : null, cfg.ttl);
+  const isFirst = Object.keys(sessions).length === 0;
+  sessions[sessionId] = nowSec();
+
   state.accounts[account] = {
     machine,
     ip: ip || '',
     loc: loc || '',
-    session: sessionId,
+    sessions,
     ts: nowSec(),
   };
   await writeState(cfg, state, messageId);
   writeMarker(sessionId, 'owner');
-  await notify(
-    cfg,
-    `✅ <b>${esc(account)}</b> mở session @ <b>${esc(machine)}</b>` +
-      ` (${esc(ip || '?')}${loc ? ' · ' + esc(loc) : ''}).`
-  );
+  if (isFirst) {
+    appendHistory('START', `${ip || '?'}${loc ? ' · ' + loc : ''}`);
+    await notify(
+      cfg,
+      staleHolder
+        ? `♻️ <b>${esc(account)}</b> tiếp quản lock (holder cũ <b>${esc(staleHolder)}</b> stale)` +
+            ` @ <b>${esc(machine)}</b> (${esc(ip || '?')}${loc ? ' · ' + esc(loc) : ''}).`
+        : `✅ <b>${esc(account)}</b> mở session @ <b>${esc(machine)}</b>` +
+            ` (${esc(ip || '?')}${loc ? ' · ' + esc(loc) : ''}).`
+    );
+  }
   return 0;
 }
 
@@ -458,9 +707,15 @@ async function onPreToolUse(cfg, input) {
     writeMarker(sessionId, 'owner'); // refresh local ts first (fast)
     try {
       const account = getAccount();
+      const { ip } = await resolveNetInfo();
       const { state, messageId } = await readState(cfg);
       const cur = state.accounts[account];
-      if (cur && cur.session === sessionId) {
+      if (sameHolder(cur, getMachine(), ip)) {
+        const sessions = liveSessions(cur, cfg.ttl);
+        sessions[sessionId] = nowSec(); // refresh (or revive) this session
+        cur.sessions = sessions;
+        delete cur.session; // drop the legacy single-session field
+        if (ip && !cur.ip) cur.ip = ip; // backfill an IP the start-time lookup missed
         cur.ts = nowSec();
         await writeState(cfg, state, messageId);
       }
@@ -483,13 +738,27 @@ async function onSessionEnd(cfg, input) {
   try {
     const account = getAccount();
     const machine = getMachine();
+    const { ip } = await resolveNetInfo();
     const { state, messageId } = await readState(cfg);
     const cur = state.accounts[account];
-    if (cur && cur.session === sessionId) {
-      delete state.accounts[account];
+    if (!sameHolder(cur, machine, ip)) return 0; // lock no longer ours
+
+    const sessions = liveSessions(cur, cfg.ttl);
+    delete sessions[sessionId];
+
+    if (Object.keys(sessions).length > 0) {
+      // Other sessions on this machine are still open → keep the lock, no noti.
+      cur.sessions = sessions;
+      delete cur.session; // drop the legacy single-session field
       await writeState(cfg, state, messageId);
-      await notify(cfg, `👋 <b>${esc(account)}</b> đóng session @ <b>${esc(machine)}</b>.`);
+      return 0;
     }
+
+    // Last session closed → release the lock and notify once.
+    delete state.accounts[account];
+    await writeState(cfg, state, messageId);
+    appendHistory('END', '');
+    await notify(cfg, `👋 <b>${esc(account)}</b> đóng session @ <b>${esc(machine)}</b>.`);
   } catch (_e) {
     /* best-effort cleanup */
   }
@@ -501,6 +770,10 @@ async function onSessionEnd(cfg, input) {
 // --------------------------------------------------------------------------
 async function main() {
   const event = String(process.argv[2] || '').toLowerCase();
+
+  // After a conflict-kill the parent is gone and stdout is a broken pipe —
+  // swallow the EPIPE instead of crashing before the Telegram report is sent.
+  process.stdout.on('error', () => {});
 
   // Watchdog: never let a hang block Claude. Fail-open on timeout.
   const watchdog = setTimeout(() => process.exit(0), WATCHDOG_MS);
@@ -535,6 +808,7 @@ if (require.main === module) {
 module.exports = {
   CONFIG_PATH,
   SECRET_PATH,
+  HISTORY_PATH,
   STATE_HEADER,
   HEARTBEAT_SEC,
   TTL_FLOOR_SEC,
@@ -547,13 +821,23 @@ module.exports = {
   saveStateMessageId,
   getAccount,
   getMachine,
+  sameHolder,
   parseStateText,
   stateText,
+  liveSessions,
   writeMarker,
   readMarker,
   removeMarker,
+  appendHistory,
+  parseTasklistPids,
+  listClaudePids,
+  currentClaudePid,
+  killPids,
   readIpCache,
   writeIpCache,
   resolveNetInfo,
+  onSessionStart,
+  onPreToolUse,
+  onSessionEnd,
   main,
 };

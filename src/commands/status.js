@@ -74,10 +74,17 @@ function printAccountRow(account, info, nowSeconds) {
   const where = [info.ip, info.loc].filter(Boolean).join(' · ') || chalk.dim('unknown');
   const ts = Number(info.ts);
   const age = Number.isFinite(ts) ? formatDuration(nowSeconds - ts) : chalk.dim('unknown');
+  const sessionCount =
+    info.sessions && typeof info.sessions === 'object'
+      ? Object.keys(info.sessions).length
+      : info.session
+        ? 1
+        : 0;
 
   console.log(`  ${chalk.bold(account)}`);
   row('  Machine', machine);
   row('  Location', where);
+  row('  Sessions', String(sessionCount));
   row('  Active for', age);
 }
 

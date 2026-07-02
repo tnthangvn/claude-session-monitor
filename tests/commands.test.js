@@ -49,6 +49,7 @@ if (!config.CONFIG_DIR.startsWith(os.tmpdir())) {
 const { status } = require('../src/commands/status');
 const { uninstall } = require('../src/commands/uninstall');
 const { init } = require('../src/commands/init');
+const { upgrade } = require('../src/commands/upgrade');
 
 const CLAUDE_DIR = path.join(TMP_HOME, '.claude');
 const PLAINTEXT_TOKEN = '123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
@@ -366,5 +367,94 @@ describe('init command', () => {
     expect(out).toContain('Could not send the confirmation message');
     expect(out).toContain('is set up');
     expect(fs.existsSync(generator.RUNNER_PATH)).toBe(false);
+  });
+
+  test('fresh install notifies "installed", re-init notifies "updated"', async () => {
+    // Arrange — no config yet: this is a fresh install.
+    inquirer.prompt.mockResolvedValue(answers({ installHook: false }));
+    telegram.testConnection.mockResolvedValue(goodConnection());
+    telegram.sendMessage.mockResolvedValue({ ok: true });
+
+    // Act — first run.
+    await init({});
+
+    // Assert — the notification says "installed".
+    expect(telegram.sendMessage).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining('installed on')
+    );
+
+    // Act — second run over the existing config (an update).
+    telegram.sendMessage.mockClear();
+    inquirer.prompt.mockResolvedValue({ installHook: false });
+    await init({});
+
+    // Assert — the notification now says "updated".
+    expect(telegram.sendMessage).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining('updated on')
+    );
+    expect(telegram.sendMessage).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining('installed on')
+    );
+  });
+});
+
+describe('upgrade command', () => {
+  test('re-installs the runtime + hooks and notifies "updated" without prompting', async () => {
+    // Arrange — a configured machine (config only; runtime not yet present).
+    config.saveConfig(sampleConfig());
+    telegram.sendMessage.mockResolvedValue({ ok: true });
+
+    // Act
+    await upgrade();
+
+    // Assert — runtime + wrappers + hooks are (re)installed from the package.
+    expect(fs.existsSync(generator.RUNNER_PATH)).toBe(true);
+    Object.values(generator.WRAPPERS).forEach((wrapper) => {
+      expect(fs.existsSync(wrapper)).toBe(true);
+    });
+    expect(claudeSettings.hasHooks()).toBe(true);
+
+    // No wizard: inquirer must never be consulted.
+    expect(inquirer.prompt).not.toHaveBeenCalled();
+
+    // The group notification is the "updated" variant, with the version.
+    const pkg = require('../package.json');
+    expect(telegram.sendMessage).toHaveBeenCalledWith(
+      expect.anything(),
+      `🔄 claude-session-monitor updated on test-machine (v${pkg.version})`
+    );
+
+    expect(output()).toContain('upgraded to');
+  });
+
+  test('refuses to run when not configured, pointing at init', async () => {
+    // Arrange — beforeEach wiped the config dir.
+
+    // Act
+    await upgrade();
+
+    // Assert
+    expect(output()).toContain('Not configured');
+    expect(process.exitCode).toBe(1);
+    expect(telegram.sendMessage).not.toHaveBeenCalled();
+    expect(fs.existsSync(generator.RUNNER_PATH)).toBe(false);
+  });
+
+  test('tolerates a notify failure and still reports the upgrade', async () => {
+    // Arrange
+    config.saveConfig(sampleConfig());
+    telegram.sendMessage.mockRejectedValue(new Error('network down'));
+
+    // Act
+    await upgrade();
+
+    // Assert — artifacts installed; failure surfaced as a warning only.
+    expect(fs.existsSync(generator.RUNNER_PATH)).toBe(true);
+    const out = output();
+    expect(out).toContain('Could not send the confirmation message');
+    expect(out).toContain('upgraded to');
   });
 });

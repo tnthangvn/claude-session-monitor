@@ -164,8 +164,28 @@ from v1 is removed), and `settings.json` is backed up before every modification.
 | `init` | Interactive setup wizard. Flags: `--dry-run` (preview runtime/hook/settings paths, write nothing), `--force` (overwrite existing config without the confirm prompt). Default lock timeout is `1800` seconds. |
 | `status` | Show the config summary (masked token, group ID, timeout, machine, pinned-state message id), **hook health** (are the hooks registered? is `runner.js` present?), and the **shared lock table** — which account is active on which machine/IP/location and for how long (read live from the pinned message). |
 | `test` | Verify the Telegram connection and send a test message to the group. |
+| `pin` | Pin one message of data onto the group, **verbatim**. By default the currently pinned message is edited in place (same `message_id`, so the hook keeps reading it). Flags: `--state` (prepend the `🔒 Claude session locks` header so the runtime parses it as shared lock state — handy for seeding/faking locks when testing conflict enforcement; warns if the JSON doesn't parse as state), `--new` (always send + pin a fresh message instead of editing). |
 | `uninstall` | Remove the three hooks from `settings.json`, delete the runtime + wrappers, and delete the local config. Flag: `--yes` (skip the confirm prompt). The pinned shared-state message is **left in place** — unpin it manually if you no longer need it. |
 | `logs` | **Legacy.** Reads a local `history.log` file. The v2 runtime does **not** write this file (the live lock state now lives in the pinned Telegram message), so `logs` will normally report "No session history yet." Use `status` to see live lock state. `-n, --lines <n>` limits output (default 20). |
+
+### `pin` examples
+
+```bash
+# Pin any line of data verbatim (edits the current pinned message in place)
+npx claude-session-monitor pin 'any data line'
+
+# Always send + pin a NEW message instead of editing the pinned one
+npx claude-session-monitor pin --new 'any data line'
+
+# Seed/fake lock state (the 🔒 header is prepended automatically) — e.g. to
+# simulate an active session on another machine and test conflict enforcement
+npx claude-session-monitor pin --state \
+  '{"v":1,"accounts":{"you@gmail.com":{"machine":"pc","ip":"1.2.3.4","loc":"Da Nang · ISP","sessions":{"<session-uuid>":1782990021818},"ts":1782990021818}}}'
+```
+
+Notes: the bot must be an Admin with the **Pin Messages** permission. Because the default mode edits the
+pinned state message in place, `pin` **overwrites the live lock table** — sessions currently holding a lock
+will re-acquire on their next heartbeat, but use it deliberately.
 
 ## Configuration & files
 
@@ -182,6 +202,44 @@ from v1 is removed), and `settings.json` is backed up before every modification.
 | Telegram pinned message | The **shared** account-lock state; the only cross-machine source of truth. |
 
 The bot token is encrypted at rest, but treat it as a secret regardless — anyone with it can post to your group.
+
+### Config example
+
+`~/.claude/session-monitor/config.json` looks like this (the `botToken` is an AES-256-GCM
+envelope, **not** a plaintext token):
+
+```json
+{
+  "version": "1.0.0",
+  "botToken": { "iv": "…", "tag": "…", "data": "…" },
+  "groupId": "-1001234567890",
+  "timeout": 1800,
+  "machineName": "laptop",
+  "installedAt": "2026-01-01T00:00:00.000Z",
+  "stateMessageId": 24
+}
+```
+
+- `groupId` — the shared group (negative; supergroups start with `-100`).
+- `stateMessageId` — id of the pinned shared-lock message; **keep this the same across machines** so they all read/write one lock.
+- `timeout` — lock inactivity window in seconds. Values below `600` are **clamped up to 600** at runtime (the lock must outlive the 120 s heartbeat), so anything under 10 min has no effect.
+- `machineName` — informational; `init`/`runner.js` fall back to the OS hostname.
+
+### Skip the prompts on another machine
+
+`init` reuses an existing valid config and only asks for what is missing (use `--force` to
+re-prompt everything). To set up a second machine **without re-entering the token or group**,
+copy **both** of these files (the token cannot be decrypted without its matching key):
+
+```bash
+# on the new machine, same paths
+~/.claude/session-monitor/config.json   # token (encrypted), groupId, stateMessageId, timeout
+~/.claude/session-monitor/.secret       # the AES key that decrypts botToken — REQUIRED
+```
+
+Then run `npx claude-session-monitor init` — it detects the valid config, skips the token/group/timeout
+prompts, and you only confirm installing the hooks. Copying `config.json` **without** `.secret`
+makes decryption fail, and `init` falls back to asking from scratch.
 
 ## Troubleshooting
 

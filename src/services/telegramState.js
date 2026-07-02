@@ -119,6 +119,52 @@ async function createAndPin(config, text) {
 }
 
 /**
+ * Pin one arbitrary line/message of text onto the group.
+ *
+ * By default the currently pinned message is edited in place (keeps the same
+ * message id, so the hook keeps reading the same message). When nothing is
+ * pinned, the pinned message is not editable by this bot, or `forceNew` is
+ * set, a fresh message is sent and pinned instead.
+ *
+ * @param {object} config { botToken, groupId }
+ * @param {string} text the exact text to pin (verbatim, no header added)
+ * @param {{ forceNew?: boolean }} [options]
+ * @returns {Promise<{ messageId: number, mode: 'edited'|'created' }>}
+ */
+async function pinText(config, text, options = {}) {
+  if (!options.forceNew) {
+    let res;
+    try {
+      res = await axios.get(apiUrl(config.botToken, 'getChat'), {
+        params: { chat_id: config.groupId },
+        timeout: REQUEST_TIMEOUT_MS,
+      });
+    } catch (err) {
+      throw friendlyError(err, 'Could not read the group (getChat failed)');
+    }
+    const pinned = res.data && res.data.result && res.data.result.pinned_message;
+    if (pinned && pinned.message_id) {
+      try {
+        await axios.post(
+          apiUrl(config.botToken, 'editMessageText'),
+          { chat_id: config.groupId, message_id: pinned.message_id, text },
+          { timeout: REQUEST_TIMEOUT_MS }
+        );
+        return { messageId: pinned.message_id, mode: 'edited' };
+      } catch (err) {
+        const desc = err.response && err.response.data && err.response.data.description;
+        if (desc && desc.includes('not modified')) {
+          return { messageId: pinned.message_id, mode: 'edited' };
+        }
+        // Pinned message is not editable by this bot → create + pin a fresh one.
+      }
+    }
+  }
+  const messageId = await createAndPin(config, text);
+  return { messageId, mode: 'created' };
+}
+
+/**
  * Ensure a GENUINELY pinned state message exists. Returns its message id.
  *
  * Only a message actually returned by getChat.pinned_message counts — a stale
@@ -152,5 +198,6 @@ module.exports = {
   stateText,
   readState,
   writeState,
+  pinText,
   ensureStateMessage,
 };
