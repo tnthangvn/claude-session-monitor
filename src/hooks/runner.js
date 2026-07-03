@@ -309,14 +309,25 @@ function stateText(state) {
   return `${STATE_HEADER}\n${JSON.stringify(state)}`;
 }
 
+/**
+ * Read the shared state from the group's pinned message.
+ * `pinned:false` means NO readable state is pinned right now (never pinned,
+ * someone unpinned it, or another message was pinned on top) — the returned
+ * messageId then falls back to the remembered stateMessageId so a write can
+ * repair the situation by editing + RE-PINNING that same message.
+ */
 async function readState(cfg) {
   const chat = await tgApi(cfg.botToken, 'getChat', { chat_id: cfg.groupId });
   const pinned = chat && chat.ok && chat.result && chat.result.pinned_message;
   if (pinned && pinned.text) {
     const parsed = parseStateText(pinned.text);
-    if (parsed) return { state: parsed, messageId: pinned.message_id };
+    if (parsed) return { state: parsed, messageId: pinned.message_id, pinned: true };
   }
-  return { state: { v: 1, accounts: {} }, messageId: cfg.stateMessageId || null };
+  return {
+    state: { v: 1, accounts: {} },
+    messageId: cfg.stateMessageId || null,
+    pinned: false,
+  };
 }
 
 /**
@@ -340,7 +351,13 @@ function liveSessions(cur, ttl) {
   return out;
 }
 
-async function writeState(cfg, state, messageId) {
+/**
+ * Persist the state. When `repin` is set (the state message is not currently
+ * pinned — e.g. a human unpinned it), a successful edit is followed by
+ * pinChatMessage on the SAME id: without this, edits land on an invisible
+ * message and every machine sees an empty state (auto-access for everyone).
+ */
+async function writeState(cfg, state, messageId, repin) {
   const text = stateText(state);
   if (messageId) {
     const r = await tgApi(cfg.botToken, 'editMessageText', {
@@ -349,7 +366,23 @@ async function writeState(cfg, state, messageId) {
       text,
     });
     // "message is not modified" is still a success for our purposes.
-    if (r && (r.ok || (r.description || '').includes('not modified'))) return messageId;
+    if (r && (r.ok || (r.description || '').includes('not modified'))) {
+      if (repin) {
+        const p = await tgApi(cfg.botToken, 'pinChatMessage', {
+          chat_id: cfg.groupId,
+          message_id: messageId,
+          disable_notification: true,
+        });
+        if (p && p.ok) {
+          appendHistory('REPIN', `message_id=${messageId}`);
+          await notify(
+            cfg,
+            `⚠️ State message bị unpin — đã pin lại (message_id ${messageId}).`
+          );
+        }
+      }
+      return messageId;
+    }
   }
   // Create + pin a fresh state message.
   const sent = await tgApi(cfg.botToken, 'sendMessage', {
@@ -498,10 +531,10 @@ function listClaudePids(procRoot = '/proc') {
  * "claude". Returns 0 when it can't be identified (non-Linux, /proc
  * unreadable, or the hook wasn't launched by claude).
  *
- * Callers exclude this pid from the conflict SIGKILL: killing our own session's
- * raw-mode TUI leaves the terminal wedged (it never restores cooked mode), so
- * every relaunch re-wedges it — the reported hang. Enforcement for this very
- * session is the 'blocked' marker (PreToolUse denies every tool call) instead.
+ * Callers exclude this pid from the immediate conflict SIGKILL and hand it to
+ * killOwnClaude() instead: SIGTERM first (the TUI restores the terminal on the
+ * way out), SIGKILL only as a fallback — a straight SIGKILL of a raw-mode TUI
+ * leaves the terminal wedged. The 'blocked' marker stays as a safety net.
  * @param {string} [procRoot] injectable for tests
  * @returns {number}
  */
@@ -554,6 +587,43 @@ function killPids(pids) {
   return { killed, failed };
 }
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const OWN_KILL_GRACE_MS = 1500;
+
+/**
+ * Terminate the claude TUI that spawned THIS hook (the conflicting session
+ * itself). SIGTERM first so the TUI can leave raw mode and restore the
+ * terminal; if it is still alive after a short grace, SIGKILL it and run
+ * `stty sane` on the controlling terminal (best-effort) so the shell is not
+ * left wedged. No-op when the pid is unknown (0).
+ * @param {number} pid
+ * @returns {Promise<boolean>} whether a termination signal was delivered
+ */
+async function killOwnClaude(pid) {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch (_e) {
+    return false;
+  }
+  await sleep(OWN_KILL_GRACE_MS);
+  try {
+    process.kill(pid, 0); // throws when it already exited gracefully
+    process.kill(pid, 'SIGKILL');
+    if (process.platform !== 'win32') {
+      try {
+        execSync('stty sane < /dev/tty', { stdio: 'ignore', timeout: 1000 });
+      } catch (_e2) {
+        /* no controlling tty (or stty absent) — nothing to restore */
+      }
+    }
+  } catch (_e) {
+    /* exited on SIGTERM — terminal restored by the TUI itself */
+  }
+  return true;
+}
+
 // --------------------------------------------------------------------------
 // stdin (hook JSON payload)
 // --------------------------------------------------------------------------
@@ -591,7 +661,7 @@ async function onSessionStart(cfg, input) {
   // 15 min, so this is usually instant.
   const { ip, loc } = await resolveNetInfo();
 
-  const { state, messageId } = await readState(cfg);
+  const { state, messageId, pinned } = await readState(cfg);
   const cur = state.accounts[account];
   const age = nowSec() - (Number(cur && cur.ts) || 0);
   const active = cur && age < cfg.ttl;
@@ -608,48 +678,48 @@ async function onSessionStart(cfg, input) {
 
   // Conflict: same account, held by a DIFFERENT machine, still fresh.
   // Policy: the lock holder is untouchable (state is READ-ONLY here) — this
-  // machine kills its own Claude processes instead. Kill first, notify after,
-  // so the Telegram report carries the real outcome; SIGKILL targets
-  // individual pids, so this hook survives its parent's death as an orphan.
+  // machine kills its own Claude processes instead, INCLUDING the session that
+  // just started. Kill others first, notify, then take down our own TUI last:
+  // SIGTERM first so it can leave raw mode and restore the terminal, SIGKILL
+  // (+ best-effort `stty sane`) if it is still alive after a short grace.
+  // SIGKILL targets individual pids, never a process group, so this hook
+  // survives its parent's death as an orphan and can finish the report.
   if (liveConflict) {
-    // This session is enforced by the marker (PreToolUse denies every tool
-    // call). We additionally SIGKILL OTHER local claude sessions, but NEVER our
-    // own TUI — killing its raw-mode terminal wedges the shell and every
-    // relaunch re-wedges it. If our own claude can't be identified, kill
-    // nothing and rely solely on the marker.
+    // Marker kept as a belt-and-braces fallback: if the kill fails for any
+    // reason, PreToolUse still denies every tool call in this session.
     writeMarker(sessionId, 'blocked');
     const myClaude = currentClaudePid();
-    const { killed, failed } = myClaude
-      ? killPids(listClaudePids().filter((p) => p !== myClaude))
-      : { killed: [], failed: [] };
+    const { killed, failed } = killPids(
+      listClaudePids().filter((p) => p !== myClaude)
+    );
     appendHistory(
       'CONFLICT',
-      `holder=${cur.machine}/${cur.ip || '?'}, killed=${killed.length}, failed=${failed.length}`
+      `holder=${cur.machine}/${cur.ip || '?'}, killed=${killed.length}` +
+        `${myClaude ? '+self' : ''}, failed=${failed.length}`
     );
     await notify(
       cfg,
       `⛔ <b>Conflict</b>\n` +
         `Account <b>${esc(account)}</b> đang được dùng ở <b>${esc(cur.machine)}</b>` +
         ` (${esc(cur.ip || '?')}${cur.loc ? ' · ' + esc(cur.loc) : ''}).\n` +
-        `Máy <b>${esc(machine)}</b> (${esc(ip || '?')}) vừa mở Claude → phiên này đã bị chặn (mọi tool call bị từ chối)` +
-        (killed.length ? ` + đã kill <b>${killed.length}</b> phiên Claude khác tại đây` : '') +
+        `Máy <b>${esc(machine)}</b> (${esc(ip || '?')}) vừa mở Claude → đã kill phiên này` +
+        (killed.length ? ` + <b>${killed.length}</b> phiên Claude khác tại đây` : '') +
         (failed.length ? ` (<b>${failed.length}</b> kill fail)` : '') +
         `.`
     );
-    // This session survives (its own claude is spared to keep the terminal
-    // usable) but is blocked: surface why so Claude can tell the user.
+    // Best-effort context for the (dying) session; harmless if the pipe broke.
     process.stdout.write(
       JSON.stringify({
         hookSpecificOutput: {
           hookEventName: 'SessionStart',
           additionalContext:
             `claude-session-monitor: account ${account} is already active on ${cur.machine} (${cur.ip || 'unknown ip'}). ` +
-            `This session is blocked — every tool call will be denied until that session ends. ` +
-            `${killed.length} other local Claude session(s) were sent SIGKILL.`,
+            `This session is being terminated; ${killed.length} other local Claude session(s) were sent SIGKILL.`,
         },
       })
     );
-    return 0; // SessionStart cannot hard-block; PreToolUse enforces via the marker.
+    await killOwnClaude(myClaude);
+    return 0; // SessionStart cannot hard-block; the kill + marker enforce.
   }
 
   // Taking over a stale lock left by a DIFFERENT machine: don't inherit its
@@ -674,7 +744,7 @@ async function onSessionStart(cfg, input) {
     sessions,
     ts: nowSec(),
   };
-  await writeState(cfg, state, messageId);
+  await writeState(cfg, state, messageId, !pinned);
   writeMarker(sessionId, 'owner');
   if (isFirst) {
     appendHistory('START', `${ip || '?'}${loc ? ' · ' + loc : ''}`);
@@ -707,17 +777,22 @@ async function onPreToolUse(cfg, input) {
     writeMarker(sessionId, 'owner'); // refresh local ts first (fast)
     try {
       const account = getAccount();
-      const { ip } = await resolveNetInfo();
-      const { state, messageId } = await readState(cfg);
+      const { ip, loc } = await resolveNetInfo();
+      const { state, messageId, pinned } = await readState(cfg);
       const cur = state.accounts[account];
-      if (sameHolder(cur, getMachine(), ip)) {
+      // `!cur` self-heals a LOST state (someone unpinned/deleted the state
+      // message): this session verifiably owns the lock (owner marker), so its
+      // entry is rebuilt and the write below re-pins the state message.
+      if (!cur || sameHolder(cur, getMachine(), ip)) {
+        const entry = cur || { machine: getMachine(), ip: ip || '', loc: loc || '' };
         const sessions = liveSessions(cur, cfg.ttl);
         sessions[sessionId] = nowSec(); // refresh (or revive) this session
-        cur.sessions = sessions;
-        delete cur.session; // drop the legacy single-session field
-        if (ip && !cur.ip) cur.ip = ip; // backfill an IP the start-time lookup missed
-        cur.ts = nowSec();
-        await writeState(cfg, state, messageId);
+        entry.sessions = sessions;
+        delete entry.session; // drop the legacy single-session field
+        if (ip && !entry.ip) entry.ip = ip; // backfill an IP the start-time lookup missed
+        entry.ts = nowSec();
+        state.accounts[account] = entry;
+        await writeState(cfg, state, messageId, !pinned);
       }
     } catch (_e) {
       /* heartbeat is best-effort */
@@ -739,7 +814,7 @@ async function onSessionEnd(cfg, input) {
     const account = getAccount();
     const machine = getMachine();
     const { ip } = await resolveNetInfo();
-    const { state, messageId } = await readState(cfg);
+    const { state, messageId, pinned } = await readState(cfg);
     const cur = state.accounts[account];
     if (!sameHolder(cur, machine, ip)) return 0; // lock no longer ours
 
@@ -750,13 +825,13 @@ async function onSessionEnd(cfg, input) {
       // Other sessions on this machine are still open → keep the lock, no noti.
       cur.sessions = sessions;
       delete cur.session; // drop the legacy single-session field
-      await writeState(cfg, state, messageId);
+      await writeState(cfg, state, messageId, !pinned);
       return 0;
     }
 
     // Last session closed → release the lock and notify once.
     delete state.accounts[account];
-    await writeState(cfg, state, messageId);
+    await writeState(cfg, state, messageId, !pinned);
     appendHistory('END', '');
     await notify(cfg, `👋 <b>${esc(account)}</b> đóng session @ <b>${esc(machine)}</b>.`);
   } catch (_e) {
@@ -833,6 +908,8 @@ module.exports = {
   listClaudePids,
   currentClaudePid,
   killPids,
+  killOwnClaude,
+  OWN_KILL_GRACE_MS,
   readIpCache,
   writeIpCache,
   resolveNetInfo,

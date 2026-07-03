@@ -651,7 +651,7 @@ describe('onSessionStart — lock check against the pinned state message', () =>
     https.get.mockRestore();
   });
 
-  test('lock held by ANOTHER machine → blocks this session, spares own TUI, state untouched', async () => {
+  test('lock held by ANOTHER machine → blocks + kills, own TUI gets SIGTERM-first, state untouched', async () => {
     // Arrange — the exact scenario a human can fake: a pinned message whose
     // JSON says the account is active on a different machine, fresh ts.
     const id = freshSessionId();
@@ -660,38 +660,49 @@ describe('onSessionStart — lock check against the pinned state message', () =>
     // Act
     const rc = await runnerOnSessionStart({ session_id: id });
 
-    // Assert — exit code and the local block marker (the real enforcement).
+    // Assert — exit code and the local block marker (the fallback enforcement).
     expect(rc).toBe(0);
     expect(runner.readMarker(id).role).toBe('blocked');
 
-    // The current session's own claude is ALWAYS spared (killing its raw-mode
-    // TUI wedges the terminal). Any kills that do happen (other local sessions)
-    // are individual SIGKILLs and never target us. NB: this suite may run
-    // inside a real Claude session, so some kills can legitimately occur.
-    const spared = runner.currentClaudePid();
+    // OTHER local sessions get individual SIGKILLs (never a process group);
+    // our OWN claude is taken down LAST via SIGTERM → grace → SIGKILL so the
+    // TUI can restore the terminal. NB: this suite may run inside a real
+    // Claude session, so `own` can be a live pid — kill is mocked.
+    const own = runner.currentClaudePid();
     for (const [pid, sig] of killSpy.mock.calls) {
-      expect(sig).toBe('SIGKILL');
       expect(pid).toBeGreaterThan(0); // a pid, never a process group (-pgid)
       expect(pid).not.toBe(process.pid);
-      if (spared) expect(pid).not.toBe(spared);
+      if (own && pid === own) {
+        expect(['SIGTERM', 0, 'SIGKILL']).toContain(sig);
+      } else {
+        expect(sig).toBe('SIGKILL');
+      }
+    }
+    if (own) {
+      // The conflicting session itself IS terminated — graceful signal first.
+      expect(
+        killSpy.mock.calls.some(([pid, sig]) => pid === own && sig === 'SIGTERM')
+      ).toBe(true);
     }
 
-    // Telegram: exactly one ⛔ notify reporting the block.
+    // Telegram: exactly one ⛔ notify reporting the kill.
     const notifies = sent('sendMessage');
     expect(notifies).toHaveLength(1);
     expect(notifies[0].params.text).toContain('⛔');
-    expect(notifies[0].params.text).toContain('đã bị chặn');
+    expect(notifies[0].params.text).toContain('đã kill phiên này');
     expect(notifies[0].params.text).toContain('may-gia-lap');
 
     // The holder's lock is NEVER stolen or cleared: no state writes at all.
     expect(sent('editMessageText')).toHaveLength(0);
     expect(sent('pinChatMessage')).toHaveLength(0);
 
-    // Local history recorded the conflict with the holder and (zero) kill counts.
+    // Local history recorded the conflict with the holder and the kill counts.
     const rows = config.readHistory();
     const last = rows[rows.length - 1];
     expect(last.event).toBe('CONFLICT');
-    expect(last.detail).toMatch(/^holder=may-gia-lap\/1\.2\.3\.4, killed=\d+, failed=\d+$/);
+    expect(last.detail).toMatch(
+      /^holder=may-gia-lap\/1\.2\.3\.4, killed=\d+(\+self)?, failed=\d+$/
+    );
 
     runner.removeMarker(id);
   });
@@ -842,6 +853,62 @@ describe('onSessionStart — lock check against the pinned state message', () =>
     expect(sent('pinChatMessage')).toHaveLength(1);
     expect(sent('pinChatMessage')[0].params.message_id).toBe(777);
     expect(runner.loadConfig().stateMessageId).toBe(777);
+
+    runner.removeMarker(id);
+  });
+
+  test('UNPIN sabotage: acquire edits the remembered state message AND re-pins it', async () => {
+    // Someone unpinned the state message. getChat shows nothing pinned, but the
+    // config remembers the message id — the write must edit THAT message and
+    // pin it back, otherwise the state stays invisible and every machine gets
+    // silent auto-access forever.
+    const id = freshSessionId();
+    runner.saveStateMessageId(555); // remembered from a previous write
+    mockTelegram({ getChat: () => ({ ok: true, result: {} }) });
+
+    // Act
+    const rc = await runnerOnSessionStart({ session_id: id });
+
+    // Assert — owner; state written to message 555 and RE-PINNED (same id).
+    expect(rc).toBe(0);
+    expect(runner.readMarker(id).role).toBe('owner');
+    expect(sent('editMessageText')[0].params.message_id).toBe(555);
+    const pins = sent('pinChatMessage');
+    expect(pins).toHaveLength(1);
+    expect(pins[0].params.message_id).toBe(555);
+    // The group is told the pin was restored (plus the normal ✅ start notice).
+    const texts = sent('sendMessage').map((c) => c.params.text);
+    expect(texts.some((t) => t.includes('⚠️') && t.includes('pin lại'))).toBe(true);
+
+    runner.removeMarker(id);
+  });
+
+  test('HEARTBEAT self-heal: owner rebuilds a lost/unpinned state and re-pins it', async () => {
+    // The state message vanished (unpinned/deleted) while this machine holds
+    // the lock. The owner's next heartbeat must rebuild its entry and re-pin —
+    // this is what closes the "unpin → everyone auto-accesses" hole between
+    // session starts.
+    const id = freshSessionId();
+    runner.saveStateMessageId(555);
+    // Owner marker with a stale local ts so the remote heartbeat actually runs.
+    fs.writeFileSync(
+      runner.markerPath(id),
+      `owner\n${Math.floor(Date.now() / 1000) - runner.HEARTBEAT_SEC - 5}\n`
+    );
+    mockTelegram({ getChat: () => ({ ok: true, result: {} }) }); // state GONE
+
+    // Act
+    const rc = await runner.onPreToolUse(runner.loadConfig(), { session_id: id });
+
+    // Assert — owner never blocked; entry rebuilt for this machine + session.
+    expect(rc).toBe(0);
+    const edit = sent('editMessageText')[0].params;
+    expect(edit.message_id).toBe(555);
+    const written = JSON.parse(edit.text.slice(edit.text.indexOf('{')));
+    expect(written.accounts[ACCOUNT].machine).toBe(os.hostname());
+    expect(written.accounts[ACCOUNT].ip).toBe('203.0.113.7');
+    expect(Object.keys(written.accounts[ACCOUNT].sessions)).toEqual([id]);
+    expect(sent('pinChatMessage')[0].params.message_id).toBe(555);
 
     runner.removeMarker(id);
   });
