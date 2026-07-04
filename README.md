@@ -1,6 +1,6 @@
 # claude-session-monitor
 
-> Lock each Claude Code CLI account to **one machine at a time**. The shared lock lives in a **pinned Telegram message**, so a second machine that opens Claude with the same account is detected across the network and blocked — with real-time notifications to your group.
+> Track each Claude Code CLI account across machines. The shared lock lives in a **pinned Telegram message**, so a second machine that opens Claude with the same account is detected across the network — with real-time start / end / conflict notifications to your group. Notify-only: no session is ever blocked or killed.
 
 <!-- badges: replace with real ones once CI + npm publish are set up -->
 ![npm](https://img.shields.io/badge/npm-1.0.0-blue)
@@ -27,13 +27,13 @@ acquires or releases a lock. This is what makes cross-machine detection actually
 
 ## Features
 
-- **Account-based locking across machines** — one account = one active machine, enforced everywhere the bot can reach.
+- **Account-based lock tracking across machines** — one account = one lock holder; a second machine is detected everywhere the bot can reach.
 - **Telegram-pinned shared state** — the lock is a single pinned message in your group, read/written by every machine.
-- **Real-time notifications** — a ✅ notice when a lock is acquired, a ⚠️ notice when a session is blocked, and a 👋 notice when a lock is released.
+- **Real-time notifications** — a ✅ notice when a session starts, a ⚠️ notice on a cross-machine conflict, and a 👋 notice when the last session ends. Notify-only: nothing is blocked or killed.
 - **Public-IP + location identification** — each machine is shown by its public/WAN IP (via `api.ipify.org`) plus city · ISP (via `ipinfo.io`) in notifications and in `status`.
 - **Three self-contained hooks** — `SessionStart`, `PreToolUse`, and `SessionEnd` are wired into `~/.claude/settings.json` automatically; no manual editing.
 - **Dependency-free runtime** — a Node-built-ins-only `runner.js` is installed under `~/.claude/session-monitor/`; only `node` on your `PATH` is required at hook time.
-- **Fail-open by design** — any config or network error makes the hooks do nothing, so they never break Claude. Only a genuine cross-machine conflict blocks tool calls.
+- **Fail-open by design** — any config or network error makes the hooks do nothing, so they never break Claude.
 - **Encrypted bot token at rest** — AES-256-GCM, config file written `0600`.
 
 ## Prerequisites
@@ -78,7 +78,7 @@ npx claude-session-monitor init
 
 The wizard will:
 
-1. Ask for your **bot token**, **group ID**, and a **session lock timeout** (default `1800` seconds).
+1. Ask for your **bot token**, **group ID**, and a **session lock timeout** (default `600` seconds = 10 minutes).
 2. **Test the Telegram connection** before saving anything.
 3. **Install the runtime + three hooks** into Claude Code.
 4. **Create and pin the shared-state message** in your group (this needs the Pin Messages permission).
@@ -138,21 +138,21 @@ shared-state message created + PINNED in the Telegram group
 At runtime, each wrapper execs `node runner.js <event>` and the runtime does one job per event:
 
 1. **SessionStart** (on `claude` launch) — read the shared state from the pinned message.
-   - If the account is **already active on a different machine** → mark this session **blocked** (a local
-     marker file), send a **⚠️ blocked** notice, and pass context to Claude. `SessionStart` itself cannot
-     hard-stop a session, so enforcement is deferred to `PreToolUse`.
+   - If the account is **already active on a different machine** → send a **⚠️ conflict** notice naming both
+     machines and pass context to Claude. The session keeps running normally — nothing is blocked or killed.
    - Otherwise **acquire the lock**: record `{machine, public IP, city·ISP, session, ts}` into the pinned
-     message and send a **✅ acquired** notice.
-2. **PreToolUse** (before every tool call) — enforcement.
-   - If this session is **blocked** → exit `2`, which **blocks the tool call** (repeated for every call until
-     the other machine releases the lock).
+     message and send a **✅ started** notice.
+2. **PreToolUse** (before every tool call) — heartbeat + conflict reminders.
    - If this session is the **owner** → a throttled heartbeat (at most every ~2 min) refreshes the lock's
      timestamp so long work sessions don't look stale.
+   - If this session started **in conflict** → every ~5 min it re-checks the holder: still active elsewhere →
+     repeat the **⚠️ reminder** (one per machine per window, however many sessions are open); released or
+     stale → silently **take the lock over** and continue as a normal owner (reminders stop).
 3. **SessionEnd** (any exit path) — if this session owns the lock, **release it**: remove the account from the
    pinned message and send a **👋 released** notice.
 
 A lock is considered "active" for at least the configured timeout (floored to **10 minutes** of inactivity),
-so a crashed session without a clean `SessionEnd` eventually expires and stops blocking others.
+so a crashed session without a clean `SessionEnd` eventually expires and stops raising conflicts.
 
 Re-running `init` updates the config and re-installs cleanly (the old single-hook `check-session-telegram.sh`
 from v1 is removed), and `settings.json` is backed up before every modification.
@@ -161,10 +161,11 @@ from v1 is removed), and `settings.json` is backed up before every modification.
 
 | Command | What it does |
 |---|---|
-| `init` | Interactive setup wizard. Flags: `--dry-run` (preview runtime/hook/settings paths, write nothing), `--force` (overwrite existing config without the confirm prompt). Default lock timeout is `1800` seconds. |
+| `init` | Interactive setup wizard. Flags: `--dry-run` (preview runtime/hook/settings paths, write nothing), `--force` (overwrite existing config without the confirm prompt). Default lock timeout is `600` seconds (10 minutes). |
 | `status` | Show the config summary (masked token, group ID, timeout, machine, pinned-state message id), **hook health** (are the hooks registered? is `runner.js` present?), and the **shared lock table** — which account is active on which machine/IP/location and for how long (read live from the pinned message). |
 | `test` | Verify the Telegram connection and send a test message to the group. |
 | `pin` | Pin one message of data onto the group, **verbatim**. By default the currently pinned message is edited in place (same `message_id`, so the hook keeps reading it). Flags: `--state` (prepend the `🔒 Claude session locks` header so the runtime parses it as shared lock state — handy for seeding/faking locks when testing conflict enforcement; warns if the JSON doesn't parse as state), `--new` (always send + pin a fresh message instead of editing). |
+| `remove-account <account>` | Remove one account's lock from the pinned shared state — recovery for the **power-loss / crash** case where a machine died without a clean `SessionEnd` and its lock would otherwise linger until the TTL expires. Prints the accounts that do hold locks when the name doesn't match, and posts a 🔓 notice to the group on success. |
 | `uninstall` | Remove the three hooks from `settings.json`, delete the runtime + wrappers, and delete the local config. Flag: `--yes` (skip the confirm prompt). The pinned shared-state message is **left in place** — unpin it manually if you no longer need it. |
 | `logs` | **Legacy.** Reads a local `history.log` file. The v2 runtime does **not** write this file (the live lock state now lives in the pinned Telegram message), so `logs` will normally report "No session history yet." Use `status` to see live lock state. `-n, --lines <n>` limits output (default 20). |
 
@@ -213,7 +214,7 @@ envelope, **not** a plaintext token):
   "version": "1.0.0",
   "botToken": { "iv": "…", "tag": "…", "data": "…" },
   "groupId": "-1001234567890",
-  "timeout": 1800,
+  "timeout": 600,
   "machineName": "laptop",
   "installedAt": "2026-01-01T00:00:00.000Z",
   "stateMessageId": 24
@@ -247,7 +248,8 @@ makes decryption fail, and `init` falls back to asking from scratch.
 - **`getMe` returns 404 / `401 Unauthorized`?** The **bot token is wrong** or was revoked. Regenerate it via `@BotFather` and run `init` again.
 - **Lock never gets created / "Could not create the pinned shared-state message"?** The bot is **not an Admin with the "Pin Messages" permission**. Promote it (see Prerequisites step 3) and run `claude-session-monitor init --force` to finish setup.
 - **Hooks not firing?** Run `claude-session-monitor status` — it reports whether the hooks are registered in `settings.json` and whether `runner.js` exists. Re-run `init` if either is missing. Also confirm `node` is on the `PATH` (the wrappers fail open — do nothing — when `node` is absent).
-- **A machine won't stop being "blocked"?** Close the Claude session on the machine that **owns** the lock (that triggers `SessionEnd` and releases it), or wait for the lock's inactivity timeout (≥10 min) to expire. Check who holds it with `status`.
+- **Conflict notices keep firing?** Close the Claude session on the machine that **owns** the lock (that triggers `SessionEnd` and releases it), or wait for the lock's inactivity timeout (≥10 min) to expire. Check who holds it with `status`.
+- **A machine crashed / lost power and its lock is stuck?** Clear it immediately with `claude-session-monitor remove-account you@example.com` — no need to wait for the TTL.
 - **Nothing in `logs`?** Expected — the v2 runtime doesn't write `history.log`. Use `status` for live lock state.
 
 ## Scope & compatibility

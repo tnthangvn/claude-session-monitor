@@ -58,7 +58,7 @@ describe('exported constants', () => {
   });
 
   test('exposes the default timeout', () => {
-    expect(config.DEFAULT_TIMEOUT).toBe(300);
+    expect(config.DEFAULT_TIMEOUT).toBe(600);
   });
 });
 

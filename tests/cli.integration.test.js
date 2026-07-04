@@ -40,9 +40,9 @@ describe('claude-session-monitor CLI', () => {
     expect(out.trim()).toBe(PKG_VERSION);
   });
 
-  test('--help lists all five commands', () => {
+  test('--help lists all commands', () => {
     const out = runCli(['--help']);
-    for (const command of ['init', 'status', 'test', 'logs', 'uninstall']) {
+    for (const command of ['init', 'status', 'test', 'logs', 'remove-account', 'uninstall']) {
       expect(out).toContain(command);
     }
     expect(out).toContain('Monitor and guard Claude Code sessions');

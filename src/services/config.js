@@ -19,7 +19,7 @@ const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
 const HISTORY_PATH = path.join(CONFIG_DIR, 'history.log');
 const SECRET_PATH = path.join(CONFIG_DIR, '.secret');
 
-const DEFAULT_TIMEOUT = 300;
+const DEFAULT_TIMEOUT = 600;
 
 // Encryption parameters.
 const ALGORITHM = 'aes-256-gcm';

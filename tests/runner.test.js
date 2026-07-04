@@ -195,17 +195,19 @@ describe('markers (writeMarker / readMarker / removeMarker)', () => {
     runner.removeMarker(id);
   });
 
-  test('overwriting an owner marker with blocked is reflected on read', () => {
+  test('rewriting a marker refreshes its content on read', () => {
     // Arrange
     const id = freshSessionId();
     runner.writeMarker(id, 'owner');
+    const first = runner.readMarker(id);
 
-    // Act
-    runner.writeMarker(id, 'blocked');
+    // Act — rewrite (as the heartbeat does) and read back.
+    runner.writeMarker(id, 'owner');
     const marker = runner.readMarker(id);
 
     // Assert
-    expect(marker.role).toBe('blocked');
+    expect(marker.role).toBe('owner');
+    expect(marker.ts).toBeGreaterThanOrEqual(first.ts);
 
     runner.removeMarker(id);
   });
@@ -379,14 +381,14 @@ describe('public-IP cache', () => {
 describe('appendHistory (runner-side local history)', () => {
   test('writes tab-separated lines that config.readHistory can parse', () => {
     // Act — write from the standalone runner, read via the CLI's parser.
-    runner.appendHistory('CONFLICT', 'holder=machine-a, killed=2, failed=0');
+    runner.appendHistory('CONFLICT', 'holder=machine-a/1.2.3.4');
     const rows = config.readHistory();
 
     // Assert
     const last = rows[rows.length - 1];
     expect(last.event).toBe('CONFLICT');
     expect(last.machine).toBe(os.hostname());
-    expect(last.detail).toBe('holder=machine-a, killed=2, failed=0');
+    expect(last.detail).toBe('holder=machine-a/1.2.3.4');
     expect(Number.isNaN(Date.parse(last.ts))).toBe(false);
   });
 
@@ -399,130 +401,6 @@ describe('appendHistory (runner-side local history)', () => {
     const last = rows[rows.length - 1];
     expect(last.event).toBe('START');
     expect(last.detail).toBe('a b c');
-  });
-});
-
-describe('listClaudePids (conflict kill targeting)', () => {
-  // A fake /proc: only numeric dirs whose comm is EXACTLY "claude" (and not
-  // this process's own pid) may be returned.
-  function fakeProc(entries) {
-    const root = path.join(TMP_HOME, `proc-${Date.now()}-${Math.random()}`);
-    for (const [pid, comm] of Object.entries(entries)) {
-      fs.mkdirSync(path.join(root, pid), { recursive: true });
-      if (comm !== null) fs.writeFileSync(path.join(root, pid, 'comm'), `${comm}\n`);
-    }
-    return root;
-  }
-
-  test('returns only pids whose comm is exactly "claude"', () => {
-    // Arrange
-    const root = fakeProc({ 101: 'claude', 202: 'node', 303: 'claude-helper' });
-
-    // Act + Assert — no substring matches (a cmdline match would catch the
-    // hook itself, whose path contains ".claude/").
-    expect(runner.listClaudePids(root)).toEqual([101]);
-  });
-
-  test('skips non-numeric entries and dirs without a readable comm', () => {
-    // Arrange
-    const root = fakeProc({ 404: 'claude', 505: null });
-    fs.mkdirSync(path.join(root, 'self'), { recursive: true });
-    fs.writeFileSync(path.join(root, 'uptime'), '12345');
-
-    // Act + Assert
-    expect(runner.listClaudePids(root)).toEqual([404]);
-  });
-
-  test('excludes this process own pid even when its comm says claude', () => {
-    // Arrange — the hook must never target itself.
-    const root = fakeProc({ [process.pid]: 'claude', 606: 'claude' });
-
-    // Act + Assert
-    expect(runner.listClaudePids(root)).toEqual([606]);
-  });
-
-  test('a missing /proc root falls through to pgrep without throwing (darwin path)', () => {
-    // Arrange — a root that does not exist forces the unix fallback branch.
-    const root = path.join(TMP_HOME, 'no-such-proc');
-
-    // Act + Assert — pgrep may or may not find real claude processes on the
-    // CI box; the contract is: an array, never our own pid, never a throw.
-    const pids = runner.listClaudePids(root);
-    expect(Array.isArray(pids)).toBe(true);
-    expect(pids).not.toContain(process.pid);
-  });
-});
-
-describe('currentClaudePid (spare our own session from the conflict kill)', () => {
-  // A fake /proc where each pid has a `comm` and a `status` (with PPid) so the
-  // parent-chain walk can be exercised deterministically.
-  function fakeProc(entries) {
-    const root = path.join(TMP_HOME, `proc-cc-${Date.now()}-${Math.random()}`);
-    for (const [pid, { comm, ppid }] of Object.entries(entries)) {
-      fs.mkdirSync(path.join(root, pid), { recursive: true });
-      if (comm !== null) fs.writeFileSync(path.join(root, pid, 'comm'), `${comm}\n`);
-      fs.writeFileSync(path.join(root, pid, 'status'), `Name:\t${comm}\nPPid:\t${ppid}\n`);
-    }
-    return root;
-  }
-
-  test('walks up the parent chain and returns the nearest claude ancestor', () => {
-    // Arrange — this hook (node) ← bash wrapper ← claude ← init.
-    const root = fakeProc({
-      [process.pid]: { comm: 'node', ppid: 900 },
-      900: { comm: 'bash', ppid: 800 },
-      800: { comm: 'claude', ppid: 1 },
-    });
-
-    // Act + Assert
-    expect(runner.currentClaudePid(root)).toBe(800);
-  });
-
-  test('returns 0 when no claude ancestor exists (e.g. run under jest)', () => {
-    // Arrange — a chain that never hits a claude comm.
-    const root = fakeProc({
-      [process.pid]: { comm: 'node', ppid: 900 },
-      900: { comm: 'bash', ppid: 1 },
-    });
-
-    // Act + Assert
-    expect(runner.currentClaudePid(root)).toBe(0);
-  });
-
-  test('returns 0 without throwing when /proc is missing', () => {
-    const root = path.join(TMP_HOME, 'no-such-proc-cc');
-    expect(runner.currentClaudePid(root)).toBe(0);
-  });
-});
-
-describe('parseTasklistPids (Windows tasklist CSV)', () => {
-  test('extracts pids from claude.exe rows only, case-insensitively', () => {
-    // Arrange — realistic `tasklist /FO CSV /NH` output.
-    const csv = [
-      '"claude.exe","1234","Console","1","145,678 K"',
-      '"Claude.EXE","5678","Console","1","98,304 K"',
-      '"node.exe","9999","Console","1","50,000 K"',
-      '"claude-helper.exe","4321","Console","1","10,000 K"',
-    ].join('\r\n');
-
-    // Act + Assert
-    expect(runner.parseTasklistPids(csv)).toEqual([1234, 5678]);
-  });
-
-  test('returns [] for the no-match INFO sentence and empty input', () => {
-    expect(
-      runner.parseTasklistPids(
-        'INFO: No tasks are running which match the specified criteria.'
-      )
-    ).toEqual([]);
-    expect(runner.parseTasklistPids('')).toEqual([]);
-    expect(runner.parseTasklistPids(null)).toEqual([]);
-  });
-
-  test('excludes this process own pid', () => {
-    // Arrange — if the hook somehow shows up as claude.exe, never self-kill.
-    const csv = `"claude.exe","${process.pid}","Console","1","1,000 K"`;
-    expect(runner.parseTasklistPids(csv)).toEqual([]);
   });
 });
 
@@ -639,7 +517,8 @@ describe('onSessionStart — lock check against the pinned state message', () =>
     config.saveConfig(runnerConfig());
     fs.writeFileSync(CLAUDE_JSON, JSON.stringify({ oauthAccount: { emailAddress: ACCOUNT } }));
     runner.writeIpCache('203.0.113.7', 'Test · Cache'); // keep acquire path offline
-    // SAFETY: never let the conflict branch SIGKILL real processes under jest.
+    // SAFETY NET: the runner must never signal any process; the spy both
+    // guards jest and lets tests assert process.kill is untouched.
     killSpy = jest.spyOn(process, 'kill').mockImplementation(() => true);
     stdoutSpy = jest.spyOn(process.stdout, 'write').mockImplementation(() => true);
   });
@@ -651,7 +530,7 @@ describe('onSessionStart — lock check against the pinned state message', () =>
     https.get.mockRestore();
   });
 
-  test('lock held by ANOTHER machine → blocks + kills, own TUI gets SIGTERM-first, state untouched', async () => {
+  test('lock held by ANOTHER machine → notify-only conflict, no kill, no marker, state untouched', async () => {
     // Arrange — the exact scenario a human can fake: a pinned message whose
     // JSON says the account is active on a different machine, fresh ts.
     const id = freshSessionId();
@@ -660,51 +539,27 @@ describe('onSessionStart — lock check against the pinned state message', () =>
     // Act
     const rc = await runnerOnSessionStart({ session_id: id });
 
-    // Assert — exit code and the local block marker (the fallback enforcement).
+    // Assert — session runs on: exit 0, a 'conflict' marker (so PreToolUse can
+    // keep reminding), and absolutely no process is killed.
     expect(rc).toBe(0);
-    expect(runner.readMarker(id).role).toBe('blocked');
+    expect(runner.readMarker(id).role).toBe('conflict');
+    expect(killSpy).not.toHaveBeenCalled();
 
-    // OTHER local sessions get individual SIGKILLs (never a process group);
-    // our OWN claude is taken down LAST via SIGTERM → grace → SIGKILL so the
-    // TUI can restore the terminal. NB: this suite may run inside a real
-    // Claude session, so `own` can be a live pid — kill is mocked.
-    const own = runner.currentClaudePid();
-    for (const [pid, sig] of killSpy.mock.calls) {
-      expect(pid).toBeGreaterThan(0); // a pid, never a process group (-pgid)
-      expect(pid).not.toBe(process.pid);
-      if (own && pid === own) {
-        expect(['SIGTERM', 0, 'SIGKILL']).toContain(sig);
-      } else {
-        expect(sig).toBe('SIGKILL');
-      }
-    }
-    if (own) {
-      // The conflicting session itself IS terminated — graceful signal first.
-      expect(
-        killSpy.mock.calls.some(([pid, sig]) => pid === own && sig === 'SIGTERM')
-      ).toBe(true);
-    }
-
-    // Telegram: exactly one ⛔ notify reporting the kill.
+    // Telegram: exactly one ⚠️ warning naming the holder.
     const notifies = sent('sendMessage');
     expect(notifies).toHaveLength(1);
-    expect(notifies[0].params.text).toContain('⛔');
-    expect(notifies[0].params.text).toContain('đã kill phiên này');
+    expect(notifies[0].params.text).toContain('⚠️');
     expect(notifies[0].params.text).toContain('may-gia-lap');
 
     // The holder's lock is NEVER stolen or cleared: no state writes at all.
     expect(sent('editMessageText')).toHaveLength(0);
     expect(sent('pinChatMessage')).toHaveLength(0);
 
-    // Local history recorded the conflict with the holder and the kill counts.
+    // Local history recorded the conflict with the holder.
     const rows = config.readHistory();
     const last = rows[rows.length - 1];
     expect(last.event).toBe('CONFLICT');
-    expect(last.detail).toMatch(
-      /^holder=may-gia-lap\/1\.2\.3\.4, killed=\d+(\+self)?, failed=\d+$/
-    );
-
-    runner.removeMarker(id);
+    expect(last.detail).toBe('holder=may-gia-lap/1.2.3.4');
   });
 
   test('a manually-crafted pinned message (any header text) is honored', async () => {
@@ -726,10 +581,11 @@ describe('onSessionStart — lock check against the pinned state message', () =>
     // Act
     const rc = await runnerOnSessionStart({ session_id: id });
 
-    // Assert — treated exactly like a bot-written lock.
+    // Assert — treated exactly like a bot-written lock: conflict warning sent.
     expect(rc).toBe(0);
-    expect(runner.readMarker(id).role).toBe('blocked');
-    expect(sent('sendMessage')[0].params.text).toContain('⛔');
+    expect(runner.readMarker(id).role).toBe('conflict');
+    expect(killSpy).not.toHaveBeenCalled();
+    expect(sent('sendMessage')[0].params.text).toContain('⚠️');
 
     runner.removeMarker(id);
   });
@@ -900,7 +756,7 @@ describe('onSessionStart — lock check against the pinned state message', () =>
     // Act
     const rc = await runner.onPreToolUse(runner.loadConfig(), { session_id: id });
 
-    // Assert — owner never blocked; entry rebuilt for this machine + session.
+    // Assert — entry rebuilt for this machine + session and re-pinned.
     expect(rc).toBe(0);
     const edit = sent('editMessageText')[0].params;
     expect(edit.message_id).toBe(555);
@@ -918,7 +774,7 @@ describe('onSessionStart — lock check against the pinned state message', () =>
   // holder identity is therefore hostname AND public IP: a matching hostname
   // with a different IP is a different machine and must conflict.
 
-  test('same hostname but DIFFERENT public IP → conflict fires and blocks (PC A vs PC B)', async () => {
+  test('same hostname but DIFFERENT public IP → conflict warning fires (PC A vs PC B)', async () => {
     // The pinned holder says machine=<this hostname> ip=116.110.29.22 while
     // this machine's cached public IP is 203.0.113.7 → different machine.
     const id = freshSessionId();
@@ -927,12 +783,14 @@ describe('onSessionStart — lock check against the pinned state message', () =>
     // Act
     const rc = await runnerOnSessionStart({ session_id: id });
 
-    // Assert — blocked, ⛔ names the holder with BOTH IPs, state untouched.
+    // Assert — notify-only: ⚠️ names the holder with BOTH IPs, a 'conflict'
+    // marker, no kill, state untouched.
     expect(rc).toBe(0);
-    expect(runner.readMarker(id).role).toBe('blocked');
+    expect(runner.readMarker(id).role).toBe('conflict');
+    expect(killSpy).not.toHaveBeenCalled();
     const notifies = sent('sendMessage');
     expect(notifies).toHaveLength(1);
-    expect(notifies[0].params.text).toContain('⛔');
+    expect(notifies[0].params.text).toContain('⚠️');
     expect(notifies[0].params.text).toContain('116.110.29.22'); // holder's IP
     expect(notifies[0].params.text).toContain('203.0.113.7'); // this machine's IP
     expect(sent('editMessageText')).toHaveLength(0);
@@ -1005,7 +863,7 @@ describe('onSessionStart — lock check against the pinned state message', () =>
     runner.removeMarker(id);
   });
 
-  test('FIX: same JSON but "machine" ≠ this host → conflict fires and blocks', async () => {
+  test('FIX: same JSON but "machine" ≠ this host → conflict warning fires', async () => {
     // The correct way to exercise conflict: the pinned "machine" must differ
     // from the real hostname. Anything but os.hostname() works.
     const id = freshSessionId();
@@ -1015,12 +873,13 @@ describe('onSessionStart — lock check against the pinned state message', () =>
     // Act
     const rc = await runnerOnSessionStart({ session_id: id });
 
-    // Assert — this session is blocked and a ⛔ conflict names the holder.
+    // Assert — a ⚠️ conflict warning names the holder; nothing is blocked.
     expect(rc).toBe(0);
-    expect(runner.readMarker(id).role).toBe('blocked');
+    expect(runner.readMarker(id).role).toBe('conflict');
+    expect(killSpy).not.toHaveBeenCalled();
     const notifies = sent('sendMessage');
     expect(notifies).toHaveLength(1);
-    expect(notifies[0].params.text).toContain('⛔');
+    expect(notifies[0].params.text).toContain('⚠️');
     expect(notifies[0].params.text).toContain(otherMachine);
 
     // Read-only: the holder's lock is never overwritten on conflict.
@@ -1031,36 +890,225 @@ describe('onSessionStart — lock check against the pinned state message', () =>
   });
 });
 
-describe('killPids', () => {
-  test('SIGKILLs a live process and reports it in `killed`', async () => {
-    // Arrange — a real disposable child that would otherwise live 60s.
-    const { spawn } = require('child_process');
-    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)']);
-    const exited = new Promise((resolve) => child.on('exit', (_c, sig) => resolve(sig)));
 
-    // Act
-    const res = runner.killPids([child.pid]);
+describe('onPreToolUse — conflict reminders (notify-only spam guard)', () => {
+  const ACCOUNT = 'x@y.com';
 
-    // Assert
-    expect(res.killed).toEqual([child.pid]);
-    expect(res.failed).toEqual([]);
-    await expect(exited).resolves.toBe('SIGKILL');
+  let apiCalls;
+
+  // Same fake Telegram transport as the onSessionStart suite: full control of
+  // the pinned message, every Bot API call captured.
+  function mockTelegram(routes) {
+    jest.spyOn(https, 'request').mockImplementation((options, cb) => {
+      let body = '';
+      const req = {
+        on: () => req,
+        setTimeout: () => req,
+        destroy: () => {},
+        write: (chunk) => {
+          body += chunk;
+        },
+        end: () => {
+          const method = String(options.path).split('/').pop();
+          const params = body ? JSON.parse(body) : {};
+          apiCalls.push({ method, params });
+          const result = routes[method]
+            ? routes[method](params)
+            : { ok: true, result: {} };
+          const res = new EventEmitter();
+          cb(res);
+          process.nextTick(() => {
+            res.emit('data', JSON.stringify(result));
+            res.emit('end');
+          });
+        },
+      };
+      return req;
+    });
+    jest.spyOn(https, 'get').mockImplementation(() => {
+      const req = {
+        on: (ev, fn) => {
+          if (ev === 'error') process.nextTick(() => fn(new Error('offline')));
+          return req;
+        },
+        setTimeout: () => req,
+        destroy: () => {},
+      };
+      return req;
+    });
+  }
+
+  function pinnedChat(stateObj, messageId = 555) {
+    return {
+      getChat: () => ({
+        ok: true,
+        result: {
+          pinned_message: {
+            message_id: messageId,
+            text: `${runner.STATE_HEADER}\n${JSON.stringify(stateObj)}`,
+          },
+        },
+      }),
+    };
+  }
+
+  function heldByOtherMachine(ts = Math.floor(Date.now() / 1000)) {
+    return {
+      v: 1,
+      accounts: {
+        [ACCOUNT]: {
+          machine: 'may-gia-lap',
+          ip: '1.2.3.4',
+          loc: 'Test · Fake',
+          sessions: { 'fake-1': ts },
+          ts,
+        },
+      },
+    };
+  }
+
+  const sent = (method) => apiCalls.filter((c) => c.method === method);
+
+  /** Write a marker whose ts is already older than the remind interval. */
+  function agedConflictMarker(id, ageSec = runner.CONFLICT_REMIND_SEC + 30) {
+    fs.writeFileSync(
+      runner.markerPath(id),
+      `conflict\n${Math.floor(Date.now() / 1000) - ageSec}\n`
+    );
+  }
+
+  function clearRemindThrottle() {
+    try {
+      fs.unlinkSync(runner.REMIND_PATH);
+    } catch (_e) {
+      /* absent */
+    }
+  }
+
+  beforeEach(() => {
+    apiCalls = [];
+    config.saveConfig(runnerConfig());
+    fs.writeFileSync(CLAUDE_JSON, JSON.stringify({ oauthAccount: { emailAddress: ACCOUNT } }));
+    runner.writeIpCache('203.0.113.7', 'Test · Cache');
+    clearRemindThrottle();
   });
 
-  test('reports a nonexistent pid in `failed` without throwing', () => {
-    // Arrange — spawn+reap a child so its pid is guaranteed dead.
-    const { spawnSync } = require('child_process');
-    const dead = spawnSync(process.execPath, ['-e', '']).pid;
-
-    // Act
-    const res = runner.killPids([dead]);
-
-    // Assert
-    expect(res.killed).toEqual([]);
-    expect(res.failed).toEqual([dead]);
+  afterEach(() => {
+    https.request.mockRestore();
+    https.get.mockRestore();
   });
 
-  test('returns empty results for an empty pid list', () => {
-    expect(runner.killPids([])).toEqual({ killed: [], failed: [] });
+  test('conflict still live + interval elapsed → sends one ⚠️ reminder, state untouched', async () => {
+    // Arrange — an aged conflict marker and a holder still fresh on the pin.
+    const id = freshSessionId();
+    agedConflictMarker(id);
+    mockTelegram(pinnedChat(heldByOtherMachine()));
+
+    // Act
+    const rc = await runner.onPreToolUse(runner.loadConfig(), { session_id: id });
+
+    // Assert — one reminder naming the holder; still a conflict marker; the
+    // holder's lock was not touched.
+    expect(rc).toBe(0);
+    expect(runner.readMarker(id).role).toBe('conflict');
+    const notifies = sent('sendMessage');
+    expect(notifies).toHaveLength(1);
+    expect(notifies[0].params.text).toContain('nhắc lại');
+    expect(notifies[0].params.text).toContain('may-gia-lap');
+    expect(sent('editMessageText')).toHaveLength(0);
+
+    // History logged the reminder.
+    const rows = config.readHistory();
+    expect(rows[rows.length - 1].event).toBe('CONFLICT');
+    expect(rows[rows.length - 1].detail).toContain('(reminder)');
+
+    runner.removeMarker(id);
+  });
+
+  test('inside the per-session interval → does nothing (no network, no notify)', async () => {
+    // Arrange — a FRESH conflict marker (ts = now).
+    const id = freshSessionId();
+    runner.writeMarker(id, 'conflict');
+    mockTelegram(pinnedChat(heldByOtherMachine()));
+
+    // Act
+    const rc = await runner.onPreToolUse(runner.loadConfig(), { session_id: id });
+
+    // Assert — throttled: not a single Bot API call.
+    expect(rc).toBe(0);
+    expect(apiCalls).toHaveLength(0);
+    expect(runner.readMarker(id).role).toBe('conflict');
+
+    runner.removeMarker(id);
+  });
+
+  test('machine-wide throttle: a second conflicted session does NOT double-post', async () => {
+    // Arrange — the machine already reminded just now (REMIND_PATH fresh),
+    // but THIS session's marker is old enough to re-check.
+    const id = freshSessionId();
+    agedConflictMarker(id);
+    runner.writeRemindTs(); // another session reminded moments ago
+    mockTelegram(pinnedChat(heldByOtherMachine()));
+
+    // Act
+    const rc = await runner.onPreToolUse(runner.loadConfig(), { session_id: id });
+
+    // Assert — the state was re-checked but no duplicate reminder was sent.
+    expect(rc).toBe(0);
+    expect(sent('sendMessage')).toHaveLength(0);
+    expect(runner.readMarker(id).role).toBe('conflict');
+
+    runner.removeMarker(id);
+  });
+
+  test('holder released the lock → takes over as owner, notifies ✅, reminders stop', async () => {
+    // Arrange — aged conflict marker, but the pinned state is now EMPTY.
+    const id = freshSessionId();
+    agedConflictMarker(id);
+    mockTelegram(pinnedChat({ v: 1, accounts: {} }));
+
+    // Act
+    const rc = await runner.onPreToolUse(runner.loadConfig(), { session_id: id });
+
+    // Assert — the session registered itself and became a normal owner.
+    expect(rc).toBe(0);
+    expect(runner.readMarker(id).role).toBe('owner');
+    const edits = sent('editMessageText');
+    expect(edits).toHaveLength(1);
+    const written = JSON.parse(edits[0].params.text.slice(edits[0].params.text.indexOf('{')));
+    expect(written.accounts[ACCOUNT].machine).toBe(os.hostname());
+    expect(Object.keys(written.accounts[ACCOUNT].sessions)).toEqual([id]);
+
+    const notifies = sent('sendMessage');
+    expect(notifies).toHaveLength(1);
+    expect(notifies[0].params.text).toContain('✅');
+    expect(notifies[0].params.text).toContain('conflict trước đó đã kết thúc');
+
+    runner.removeMarker(id);
+  });
+
+  test('holder went stale (no heartbeat > 10 min) → also takes over as owner', async () => {
+    // Arrange — the holder's ts is older than TTL_FLOOR_SEC.
+    const id = freshSessionId();
+    agedConflictMarker(id);
+    mockTelegram(
+      pinnedChat(
+        heldByOtherMachine(Math.floor(Date.now() / 1000) - runner.TTL_FLOOR_SEC - 60)
+      )
+    );
+
+    // Act
+    const rc = await runner.onPreToolUse(runner.loadConfig(), { session_id: id });
+
+    // Assert — owner now; the stale holder's sessions were dropped.
+    expect(rc).toBe(0);
+    expect(runner.readMarker(id).role).toBe('owner');
+    const edits = sent('editMessageText');
+    expect(edits).toHaveLength(1);
+    const written = JSON.parse(edits[0].params.text.slice(edits[0].params.text.indexOf('{')));
+    expect(written.accounts[ACCOUNT].machine).toBe(os.hostname());
+    expect(Object.keys(written.accounts[ACCOUNT].sessions)).toEqual([id]);
+
+    runner.removeMarker(id);
   });
 });

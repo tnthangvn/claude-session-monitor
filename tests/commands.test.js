@@ -50,6 +50,7 @@ const { status } = require('../src/commands/status');
 const { uninstall } = require('../src/commands/uninstall');
 const { init } = require('../src/commands/init');
 const { upgrade } = require('../src/commands/upgrade');
+const { removeAccount } = require('../src/commands/removeAccount');
 
 const CLAUDE_DIR = path.join(TMP_HOME, '.claude');
 const PLAINTEXT_TOKEN = '123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
@@ -456,5 +457,125 @@ describe('upgrade command', () => {
     const out = output();
     expect(out).toContain('Could not send the confirmation message');
     expect(out).toContain('upgraded to');
+  });
+});
+
+describe('remove-account command', () => {
+  const LOCKED_STATE = () => ({
+    state: {
+      v: 1,
+      accounts: {
+        'you@example.com': {
+          machine: 'pc-a',
+          ip: '1.2.3.4',
+          loc: 'Hanoi · VNPT',
+          sessions: { 's1': 1750000000, 's2': 1750000100 },
+          ts: 1750000100,
+        },
+        'other@example.com': {
+          machine: 'pc-b',
+          ip: '5.6.7.8',
+          loc: '',
+          sessions: { 's3': 1750000000 },
+          ts: 1750000000,
+        },
+      },
+    },
+    messageId: 555,
+  });
+
+  test('removes the named account from the pinned state and notifies the group', async () => {
+    // Arrange — two accounts hold locks; we clear the crashed one.
+    config.saveConfig(sampleConfig());
+    telegramState.readState.mockResolvedValue(LOCKED_STATE());
+    telegramState.writeState.mockResolvedValue(555);
+    telegram.sendMessage.mockResolvedValue({ ok: true });
+
+    // Act
+    await removeAccount('you@example.com');
+
+    // Assert — the state written back keeps ONLY the other account.
+    expect(telegramState.writeState).toHaveBeenCalledTimes(1);
+    const [, writtenState, messageId] = telegramState.writeState.mock.calls[0];
+    expect(Object.keys(writtenState.accounts)).toEqual(['other@example.com']);
+    expect(messageId).toBe(555);
+
+    // The group is told about the manual unlock, naming account + machine.
+    expect(telegram.sendMessage).toHaveBeenCalledTimes(1);
+    const noticeText = telegram.sendMessage.mock.calls[0][1];
+    expect(noticeText).toContain('🔓');
+    expect(noticeText).toContain('you@example.com');
+    expect(noticeText).toContain('pc-a');
+
+    // Local history records the manual removal.
+    const rows = config.readHistory();
+    const last = rows[rows.length - 1];
+    expect(last.event).toBe('REMOVE');
+    expect(last.detail).toBe('account=you@example.com, holder=pc-a/1.2.3.4');
+
+    expect(output()).toContain('Removed the lock for you@example.com');
+    expect(process.exitCode).toBe(0);
+  });
+
+  test('unknown account → exits 1 and lists the accounts that DO hold locks', async () => {
+    // Arrange
+    config.saveConfig(sampleConfig());
+    telegramState.readState.mockResolvedValue(LOCKED_STATE());
+
+    // Act
+    await removeAccount('nobody@example.com');
+
+    // Assert — nothing was written or notified; the user sees what exists.
+    expect(telegramState.writeState).not.toHaveBeenCalled();
+    expect(telegram.sendMessage).not.toHaveBeenCalled();
+    const out = output();
+    expect(out).toContain('No lock found for account "nobody@example.com"');
+    expect(out).toContain('you@example.com');
+    expect(out).toContain('other@example.com');
+    expect(process.exitCode).toBe(1);
+  });
+
+  test('empty shared state → exits 1 with a nothing-to-remove message', async () => {
+    // Arrange
+    config.saveConfig(sampleConfig());
+    telegramState.readState.mockResolvedValue({ state: { v: 1, accounts: {} }, messageId: null });
+
+    // Act
+    await removeAccount('you@example.com');
+
+    // Assert
+    expect(telegramState.writeState).not.toHaveBeenCalled();
+    expect(output()).toContain('no locks at all');
+    expect(process.exitCode).toBe(1);
+  });
+
+  test('refuses to run when not configured, pointing at init', async () => {
+    // Arrange — beforeEach wiped the config dir.
+
+    // Act
+    await removeAccount('you@example.com');
+
+    // Assert
+    expect(output()).toContain('Not configured');
+    expect(process.exitCode).toBe(1);
+    expect(telegramState.readState).not.toHaveBeenCalled();
+  });
+
+  test('a notify failure does not fail the removal (state write is the real fix)', async () => {
+    // Arrange
+    config.saveConfig(sampleConfig());
+    telegramState.readState.mockResolvedValue(LOCKED_STATE());
+    telegramState.writeState.mockResolvedValue(555);
+    telegram.sendMessage.mockRejectedValue(new Error('network down'));
+
+    // Act
+    await removeAccount('you@example.com');
+
+    // Assert — removed + warned, exit stays 0.
+    expect(telegramState.writeState).toHaveBeenCalledTimes(1);
+    const out = output();
+    expect(out).toContain('Telegram notice could not be sent');
+    expect(out).toContain('Removed the lock for you@example.com');
+    expect(process.exitCode).toBe(0);
   });
 });

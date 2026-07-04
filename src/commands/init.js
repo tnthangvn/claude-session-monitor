@@ -20,7 +20,7 @@ const {
 const { maskToken } = require('../utils/formatters');
 
 const CONFIG_VERSION = '1.0.0';
-const DEFAULT_TIMEOUT = 1800;
+const DEFAULT_TIMEOUT = 600;
 
 /**
  * Print a section header for clearer, sectioned wizard output.

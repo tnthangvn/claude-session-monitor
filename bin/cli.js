@@ -72,6 +72,14 @@ program
   .action(runner((text, options) => require('../src/commands/pin').pin(text, options)));
 
 program
+  .command('remove-account')
+  .description(
+    'Remove one account\'s lock from the pinned shared state (recovery after a crash / power loss)'
+  )
+  .argument('<account>', 'the account key shown in `status` (usually the email)')
+  .action(runner((account, options) => require('../src/commands/removeAccount').removeAccount(account, options)));
+
+program
   .command('uninstall')
   .description('Remove the hook, generated script, and configuration')
   .option('--yes', 'skip the confirmation prompt')
