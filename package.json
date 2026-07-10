@@ -1,6 +1,6 @@
 {
   "name": "claude-session-monitor",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "description": "Monitor Claude Code CLI sessions, detect concurrent sessions across machines, and notify a Telegram group via a PreToolUse hook.",
   "license": "MIT",
   "author": "Thang TN <tnthangvn@gmail.com>",
