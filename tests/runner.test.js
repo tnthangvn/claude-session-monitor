@@ -491,19 +491,33 @@ describe('onSessionStart — lock check against the pinned state message', () =>
   // parameterized so the same real-world shape drives both the same-machine
   // (join) and cross-machine (conflict) outcomes.
   const REAL_SESSION_ID = '797c2a4b-61bf-485b-93e1-1b2c3d4e5f60';
-  function realWorldState({ machine, ts = Math.floor(Date.now() / 1000) }) {
+  function realWorldState({ machine, mid, ip = '116.110.29.22', ts = Math.floor(Date.now() / 1000) }) {
     return {
       v: 1,
       accounts: {
         [ACCOUNT]: {
           machine,
-          ip: '116.110.29.22',
+          ...(mid ? { mid } : {}),
+          ip,
           loc: 'Da Nang · Viettel Corporation',
           sessions: { [REAL_SESSION_ID]: ts },
           ts,
         },
       },
     };
+  }
+
+  // A deterministic MAC-derived machine id: force one physical NIC so both the
+  // runtime under test and the fixtures agree on getMachineId() regardless of
+  // the host/CI hardware. Returns { mid, restore } — call restore() when done.
+  function withFakeNic(mac) {
+    const spy = jest
+      .spyOn(os, 'networkInterfaces')
+      .mockReturnValue({
+        lo: [{ address: '127.0.0.1', mac: '00:00:00:00:00:00', internal: true, family: 'IPv4' }],
+        eth0: [{ address: '10.0.0.2', mac, internal: false, family: 'IPv4' }],
+      });
+    return { mid: runner.getMachineId(), restore: () => spy.mockRestore() };
   }
 
   const sent = (method) => apiCalls.filter((c) => c.method === method);
@@ -769,22 +783,25 @@ describe('onSessionStart — lock check against the pinned state message', () =>
     runner.removeMarker(id);
   });
 
-  // ---- real-world repro from the hand-pinned JSON (image.png) --------------
-  // PC A and PC B are DIFFERENT machines that share the hostname "pc". The
-  // holder identity is therefore hostname AND public IP: a matching hostname
-  // with a different IP is a different machine and must conflict.
+  // ---- MAC-based identity: IP switches must NOT manufacture conflicts -------
+  // Identity is the stable hashed machine id (`mid`, from the NIC MAC), not the
+  // public IP. Two machines sharing a hostname have DIFFERENT mids → conflict;
+  // one machine whose office link switches IP keeps its mid → no conflict.
 
-  test('same hostname but DIFFERENT public IP → conflict warning fires (PC A vs PC B)', async () => {
-    // The pinned holder says machine=<this hostname> ip=116.110.29.22 while
-    // this machine's cached public IP is 203.0.113.7 → different machine.
+  test('same hostname, DIFFERENT machine id (mid) → conflict warning fires (PC A vs PC B)', async () => {
+    // The pinned holder shares this hostname but carries a foreign mid → a
+    // genuinely different physical machine.
     const id = freshSessionId();
-    mockTelegram(pinnedChat(realWorldState({ machine: os.hostname() })));
+    const nic = withFakeNic('aa:bb:cc:dd:ee:01'); // this machine's NIC
+    mockTelegram(
+      pinnedChat(realWorldState({ machine: os.hostname(), mid: 'ffffffffffffffff' }))
+    );
 
     // Act
     const rc = await runnerOnSessionStart({ session_id: id });
 
-    // Assert — notify-only: ⚠️ names the holder with BOTH IPs, a 'conflict'
-    // marker, no kill, state untouched.
+    // Assert — notify-only conflict: ⚠️ names the holder, marker set, no kill,
+    // holder state untouched.
     expect(rc).toBe(0);
     expect(runner.readMarker(id).role).toBe('conflict');
     expect(killSpy).not.toHaveBeenCalled();
@@ -796,6 +813,30 @@ describe('onSessionStart — lock check against the pinned state message', () =>
     expect(sent('editMessageText')).toHaveLength(0);
     expect(sent('pinChatMessage')).toHaveLength(0);
 
+    nic.restore();
+    runner.removeMarker(id);
+  });
+
+  test('same machine, public IP SWITCHED (same mid, different IP) → joins, NO conflict', async () => {
+    // The office link flipped from 116.110.29.22 to this session's 203.0.113.7
+    // on the SAME physical machine. Old IP-based identity fired a false
+    // conflict; MAC-based identity recognises the same mid and joins silently.
+    const id = freshSessionId();
+    const nic = withFakeNic('aa:bb:cc:dd:ee:01');
+    mockTelegram(
+      pinnedChat(realWorldState({ machine: os.hostname(), mid: nic.mid, ip: '116.110.29.22' }))
+    );
+
+    // Act
+    const rc = await runnerOnSessionStart({ session_id: id });
+
+    // Assert — joined as owner, no ⚠️ conflict, nothing killed.
+    expect(rc).toBe(0);
+    expect(runner.readMarker(id).role).toBe('owner');
+    expect(killSpy).not.toHaveBeenCalled();
+    expect(sent('sendMessage')).toHaveLength(0);
+
+    nic.restore();
     runner.removeMarker(id);
   });
 

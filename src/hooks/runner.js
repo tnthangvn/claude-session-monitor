@@ -127,18 +127,70 @@ function getAccount() {
 const getMachine = () => os.hostname();
 
 /**
- * Whether the lock entry `cur` belongs to THIS machine: the hostname AND the
- * public IP must both match. Hostnames collide in practice (two PCs both named
- * "pc"), so a matching hostname with a DIFFERENT public IP is a different
- * machine → conflict. The IP is only compared when BOTH sides know it: a
- * failed/offline lookup on either side falls back to the hostname comparison
- * rather than manufacturing a false conflict.
+ * The raw MAC address of the primary physical NIC, or '' when none is usable.
+ * Loopback and virtual adapters (docker/bridge/veth/vpn/vm) are skipped: their
+ * MACs are random per container/boot and do not identify the machine. When a
+ * host has several physical adapters the candidates are sorted by interface
+ * name so the SAME one is chosen on every run (stable id).
  */
-function sameHolder(cur, machine, ip) {
+function primaryMac() {
+  const ifaces = os.networkInterfaces();
+  const virtual =
+    /^(lo|docker|br-|veth|virbr|vnet|vmnet|vboxnet|tun|tap|utun|awdl|llw|bridge|zt|wg|tailscale)/i;
+  const macs = [];
+  for (const name of Object.keys(ifaces)) {
+    if (virtual.test(name)) continue;
+    for (const ni of ifaces[name] || []) {
+      if (ni.internal) continue;
+      const mac = (ni.mac || '').toLowerCase();
+      if (!mac || mac === '00:00:00:00:00:00') continue;
+      macs.push({ name, mac });
+    }
+  }
+  if (macs.length === 0) return '';
+  macs.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  return macs[0].mac;
+}
+
+/**
+ * A STABLE, HASHED machine id derived from the physical NIC MAC — '' when no
+ * usable NIC exists (callers then fall back to a hostname-only identity).
+ *
+ * The public IP was previously part of the holder identity to disambiguate
+ * colliding hostnames, but it is unstable: an office link can switch between two
+ * public IPs on the SAME physical machine, which manufactured false
+ * cross-machine conflicts. A NIC's MAC does not change when the IP switches, so
+ * it is the reliable machine identity. The raw MAC is never stored or sent — it
+ * is hashed with HMAC-SHA256 keyed by the local `.secret` (falling back to a
+ * plain SHA-256 digest when the secret is absent), so the hardware address
+ * cannot be recovered from the pinned Telegram state or the history log.
+ */
+function getMachineId() {
+  const mac = primaryMac();
+  if (!mac) return '';
+  let key = null;
+  try {
+    key = fs.readFileSync(SECRET_PATH); // per-install 32-byte key
+  } catch (_e) {
+    /* secret not provisioned yet → unkeyed digest is still stable per machine */
+  }
+  const h = key ? crypto.createHmac('sha256', key) : crypto.createHash('sha256');
+  return h.update(mac).digest('hex').slice(0, 16);
+}
+
+/**
+ * Whether the lock entry `cur` belongs to THIS machine. Identity is the stable
+ * hashed machine id (`mid`, from the physical NIC MAC): globally unique AND
+ * unchanged when the public IP switches, so an office that alternates between
+ * two public IPs on one machine no longer manufactures a false conflict. The
+ * `mid` is only compared when BOTH sides have it; older entries (or a host with
+ * no usable NIC) carry none, so the comparison falls back to the hostname alone
+ * — never to the volatile IP, which was the source of the false conflicts.
+ */
+function sameHolder(cur, machine, mid) {
   if (!cur) return false;
-  if (cur.machine !== machine) return false;
-  if (cur.ip && ip && cur.ip !== ip) return false;
-  return true;
+  if (cur.mid && mid) return cur.mid === mid;
+  return cur.machine === machine;
 }
 
 // --------------------------------------------------------------------------
@@ -503,18 +555,19 @@ function readStdin() {
 async function onSessionStart(cfg, input) {
   const account = getAccount();
   const machine = getMachine();
+  const mid = getMachineId();
   const sessionId = input.session_id || 'unknown';
 
-  // Resolved BEFORE the conflict check: the public IP is part of the holder
-  // identity (hostnames collide — two PCs both named "pc"). Cached on disk for
-  // 15 min, so this is usually instant.
+  // Resolved for DISPLAY only (Telegram/history show where the machine is). The
+  // holder identity is the stable MAC-derived `mid`, not the IP — the IP can
+  // switch between two office links on one machine. Cached on disk for 15 min.
   const { ip, loc } = await resolveNetInfo();
 
   const { state, messageId, pinned } = await readState(cfg);
   const cur = state.accounts[account];
   const age = nowSec() - (Number(cur && cur.ts) || 0);
   const active = cur && age < cfg.ttl;
-  const ours = sameHolder(cur, machine, ip);
+  const ours = sameHolder(cur, machine, mid);
 
   // A holder on a DIFFERENT machine (hostname OR public IP differs) is a LIVE
   // conflict only while it has been seen recently (within TTL_FLOOR_SEC — long
@@ -572,6 +625,7 @@ async function onSessionStart(cfg, input) {
 
   state.accounts[account] = {
     machine,
+    mid,
     ip: ip || '',
     loc: loc || '',
     sessions,
@@ -604,11 +658,12 @@ async function onPreToolUse(cfg, input) {
     try {
       const account = getAccount();
       const machine = getMachine();
+      const mid = getMachineId();
       const { ip, loc } = await resolveNetInfo();
       const { state, messageId, pinned } = await readState(cfg);
       const cur = state.accounts[account];
       const age = nowSec() - (Number(cur && cur.ts) || 0);
-      const ours = sameHolder(cur, machine, ip);
+      const ours = sameHolder(cur, machine, mid);
 
       if (cur && !ours && age < TTL_FLOOR_SEC) {
         // Still a live conflict. One reminder per machine per window: several
@@ -632,6 +687,7 @@ async function onPreToolUse(cfg, input) {
         sessions[sessionId] = nowSec();
         state.accounts[account] = {
           machine,
+          mid,
           ip: ip || '',
           loc: loc || '',
           sessions,
@@ -659,19 +715,21 @@ async function onPreToolUse(cfg, input) {
     writeMarker(sessionId, 'owner'); // refresh local ts first (fast)
     try {
       const account = getAccount();
+      const mid = getMachineId();
       const { ip, loc } = await resolveNetInfo();
       const { state, messageId, pinned } = await readState(cfg);
       const cur = state.accounts[account];
       // `!cur` self-heals a LOST state (someone unpinned/deleted the state
       // message): this session verifiably owns the lock (owner marker), so its
       // entry is rebuilt and the write below re-pins the state message.
-      if (!cur || sameHolder(cur, getMachine(), ip)) {
-        const entry = cur || { machine: getMachine(), ip: ip || '', loc: loc || '' };
+      if (!cur || sameHolder(cur, getMachine(), mid)) {
+        const entry = cur || { machine: getMachine(), mid, ip: ip || '', loc: loc || '' };
         const sessions = liveSessions(cur, cfg.ttl);
         sessions[sessionId] = nowSec(); // refresh (or revive) this session
         entry.sessions = sessions;
         delete entry.session; // drop the legacy single-session field
         if (ip && !entry.ip) entry.ip = ip; // backfill an IP the start-time lookup missed
+        if (mid && !entry.mid) entry.mid = mid; // backfill mid on a legacy entry
         entry.ts = nowSec();
         state.accounts[account] = entry;
         await writeState(cfg, state, messageId, !pinned);
@@ -696,10 +754,10 @@ async function onSessionEnd(cfg, input) {
   try {
     const account = getAccount();
     const machine = getMachine();
-    const { ip } = await resolveNetInfo();
+    const mid = getMachineId();
     const { state, messageId, pinned } = await readState(cfg);
     const cur = state.accounts[account];
-    if (!sameHolder(cur, machine, ip)) return 0; // lock no longer ours
+    if (!sameHolder(cur, machine, mid)) return 0; // lock no longer ours
 
     const sessions = liveSessions(cur, cfg.ttl);
     delete sessions[sessionId];
@@ -781,6 +839,8 @@ module.exports = {
   saveStateMessageId,
   getAccount,
   getMachine,
+  primaryMac,
+  getMachineId,
   sameHolder,
   parseStateText,
   stateText,
