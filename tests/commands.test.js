@@ -141,8 +141,6 @@ describe('status command', () => {
         accounts: {
           'dev@example.com': {
             machine: 'host-a',
-            ip: '203.0.113.7',
-            loc: 'Hanoi · VNPT',
             session: 'sess-1',
             ts: now - 120,
           },
@@ -161,7 +159,6 @@ describe('status command', () => {
     expect(out).toContain('Shared lock state');
     expect(out).toContain('dev@example.com');
     expect(out).toContain('host-a');
-    expect(out).toContain('203.0.113.7');
     expect(out).toContain('42'); // stateMessageId shown
   });
 

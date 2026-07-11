@@ -318,66 +318,6 @@ describe('getAccount', () => {
   });
 });
 
-describe('public-IP cache', () => {
-  beforeEach(() => {
-    try {
-      fs.unlinkSync(runner.IP_CACHE_PATH);
-    } catch (_e) {
-      /* ignore */
-    }
-  });
-
-  test('readIpCache returns null when no cache file exists', () => {
-    expect(runner.readIpCache()).toBeNull();
-  });
-
-  test('writeIpCache then readIpCache roundtrips ip, loc, and a numeric ts', () => {
-    // Act
-    runner.writeIpCache('116.110.29.22', 'Da Nang · Viettel');
-    const cached = runner.readIpCache();
-
-    // Assert
-    expect(cached.ip).toBe('116.110.29.22');
-    expect(cached.loc).toBe('Da Nang · Viettel');
-    expect(Number.isFinite(cached.ts)).toBe(true);
-  });
-
-  test('cache file lives under the isolated session-monitor dir', () => {
-    expect(runner.IP_CACHE_PATH.startsWith(os.tmpdir())).toBe(true);
-    expect(runner.IP_CACHE_PATH.endsWith('.ipcache')).toBe(true);
-  });
-
-  test('resolveNetInfo returns the cached value without any network call when fresh', async () => {
-    // Arrange — a fresh cache entry (ts = now).
-    runner.writeIpCache('203.0.113.7', 'Hanoi · VNPT');
-
-    // Act — must resolve fast from disk, never hitting the IP services.
-    const started = Date.now();
-    const info = await runner.resolveNetInfo();
-    const elapsed = Date.now() - started;
-
-    // Assert
-    expect(info).toEqual({ ip: '203.0.113.7', loc: 'Hanoi · VNPT' });
-    expect(elapsed).toBeLessThan(200);
-  });
-
-  test('readIpCache reflects a stale entry (old ts) so resolveNetInfo will refetch', () => {
-    // Arrange — ensure the dir exists, then write a manually-staled entry.
-    fs.mkdirSync(path.dirname(runner.IP_CACHE_PATH), { recursive: true });
-    fs.writeFileSync(
-      runner.IP_CACHE_PATH,
-      JSON.stringify({ ip: '1.1.1.1', loc: 'old', ts: 1 })
-    );
-
-    // Act
-    const cached = runner.readIpCache();
-
-    // Assert — TTL window is far in the past, so this is stale.
-    expect(cached.ts).toBe(1);
-    expect(Math.floor(Date.now() / 1000) - cached.ts).toBeGreaterThan(runner.IP_CACHE_TTL_SEC);
-  });
-});
-
 describe('appendHistory (runner-side local history)', () => {
   test('writes tab-separated lines that config.readHistory can parse', () => {
     // Act — write from the standalone runner, read via the CLI's parser.
@@ -440,18 +380,6 @@ describe('onSessionStart — lock check against the pinned state message', () =>
             res.emit('end');
           });
         },
-      };
-      return req;
-    });
-    // Any stray public-IP lookup fails fast instead of hitting the network.
-    jest.spyOn(https, 'get').mockImplementation(() => {
-      const req = {
-        on: (ev, fn) => {
-          if (ev === 'error') process.nextTick(() => fn(new Error('offline')));
-          return req;
-        },
-        setTimeout: () => req,
-        destroy: () => {},
       };
       return req;
     });
@@ -530,7 +458,6 @@ describe('onSessionStart — lock check against the pinned state message', () =>
     apiCalls = [];
     config.saveConfig(runnerConfig());
     fs.writeFileSync(CLAUDE_JSON, JSON.stringify({ oauthAccount: { emailAddress: ACCOUNT } }));
-    runner.writeIpCache('203.0.113.7', 'Test · Cache'); // keep acquire path offline
     // SAFETY NET: the runner must never signal any process; the spy both
     // guards jest and lets tests assert process.kill is untouched.
     killSpy = jest.spyOn(process, 'kill').mockImplementation(() => true);
@@ -541,7 +468,6 @@ describe('onSessionStart — lock check against the pinned state message', () =>
     killSpy.mockRestore();
     stdoutSpy.mockRestore();
     https.request.mockRestore();
-    https.get.mockRestore();
   });
 
   test('lock held by ANOTHER machine → notify-only conflict, no kill, no marker, state untouched', async () => {
@@ -573,7 +499,7 @@ describe('onSessionStart — lock check against the pinned state message', () =>
     const rows = config.readHistory();
     const last = rows[rows.length - 1];
     expect(last.event).toBe('CONFLICT');
-    expect(last.detail).toBe('holder=may-gia-lap/1.2.3.4');
+    expect(last.detail).toBe('holder=may-gia-lap');
   });
 
   test('a manually-crafted pinned message (any header text) is honored', async () => {
@@ -697,7 +623,7 @@ describe('onSessionStart — lock check against the pinned state message', () =>
     const rows = config.readHistory();
     const takeover = rows.reverse().find((r) => r.event === 'TAKEOVER');
     expect(takeover).toBeDefined();
-    expect(takeover.detail).toMatch(/^stale holder=may-gia-lap\/1\.2\.3\.4, age=\d+s$/);
+    expect(takeover.detail).toMatch(/^stale holder=may-gia-lap, age=\d+s$/);
 
     runner.removeMarker(id);
   });
@@ -776,7 +702,6 @@ describe('onSessionStart — lock check against the pinned state message', () =>
     expect(edit.message_id).toBe(555);
     const written = JSON.parse(edit.text.slice(edit.text.indexOf('{')));
     expect(written.accounts[ACCOUNT].machine).toBe(os.hostname());
-    expect(written.accounts[ACCOUNT].ip).toBe('203.0.113.7');
     expect(Object.keys(written.accounts[ACCOUNT].sessions)).toEqual([id]);
     expect(sent('pinChatMessage')[0].params.message_id).toBe(555);
 
@@ -808,8 +733,7 @@ describe('onSessionStart — lock check against the pinned state message', () =>
     const notifies = sent('sendMessage');
     expect(notifies).toHaveLength(1);
     expect(notifies[0].params.text).toContain('⚠️');
-    expect(notifies[0].params.text).toContain('116.110.29.22'); // holder's IP
-    expect(notifies[0].params.text).toContain('203.0.113.7'); // this machine's IP
+    expect(notifies[0].params.text).toContain(ACCOUNT); // names the conflicted account
     expect(sent('editMessageText')).toHaveLength(0);
     expect(sent('pinChatMessage')).toHaveLength(0);
 
@@ -873,10 +797,9 @@ describe('onSessionStart — lock check against the pinned state message', () =>
   });
 
   test('same hostname, OUR IP lookup fails → falls back to hostname match and joins', async () => {
-    // No usable local IP (empty cache + offline): hostname comparison decides.
+    // No usable local IP: hostname comparison decides.
     const now = Math.floor(Date.now() / 1000);
     const id = freshSessionId();
-    runner.writeIpCache('', ''); // fresh cache entry with an unknown IP
     mockTelegram(
       pinnedChat({
         v: 1,
@@ -1030,13 +953,11 @@ describe('onPreToolUse — conflict reminders (notify-only spam guard)', () => {
     apiCalls = [];
     config.saveConfig(runnerConfig());
     fs.writeFileSync(CLAUDE_JSON, JSON.stringify({ oauthAccount: { emailAddress: ACCOUNT } }));
-    runner.writeIpCache('203.0.113.7', 'Test · Cache');
     clearRemindThrottle();
   });
 
   afterEach(() => {
     https.request.mockRestore();
-    https.get.mockRestore();
   });
 
   test('conflict still live + interval elapsed → sends one ⚠️ reminder, state untouched', async () => {

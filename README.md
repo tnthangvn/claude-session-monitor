@@ -18,7 +18,7 @@ Each Claude account (identified by `oauthAccount.emailAddress` in your `~/.claud
 The shared source of truth is **one pinned Telegram message** holding JSON:
 
 ```json
-{ "v": 1, "accounts": { "you@example.com": { "machine": "laptop", "ip": "203.0.113.7", "loc": "Hanoi · VNPT", "session": "…", "ts": 1750000000 } } }
+{ "v": 1, "accounts": { "you@example.com": { "machine": "laptop", "mid": "a1b2c3d4e5f6a7b8", "session": "…", "ts": 1750000000 } } }
 ```
 
 Every machine reads that message (`getChat` → `pinned_message`) and updates it (`editMessageText`) when it
@@ -30,7 +30,7 @@ acquires or releases a lock. This is what makes cross-machine detection actually
 - **Account-based lock tracking across machines** — one account = one lock holder; a second machine is detected everywhere the bot can reach.
 - **Telegram-pinned shared state** — the lock is a single pinned message in your group, read/written by every machine.
 - **Real-time notifications** — a ✅ notice when a session starts, a ⚠️ notice on a cross-machine conflict, and a 👋 notice when the last session ends. Notify-only: nothing is blocked or killed.
-- **Public-IP + location identification** — each machine is shown by its public/WAN IP (via `api.ipify.org`) plus city · ISP (via `ipinfo.io`) in notifications and in `status`.
+- **Stable machine identity** — each machine is identified by a hashed physical-NIC MAC (`mid`), so an office link that switches public IPs on the same machine no longer manufactures a false cross-machine conflict. The raw MAC is never stored or sent; notifications and `status` show the machine hostname.
 - **Three self-contained hooks** — `SessionStart`, `PreToolUse`, and `SessionEnd` are wired into `~/.claude/settings.json` automatically; no manual editing.
 - **Dependency-free runtime** — a Node-built-ins-only `runner.js` is installed under `~/.claude/session-monitor/`; only `node` on your `PATH` is required at hook time.
 - **Fail-open by design** — any config or network error makes the hooks do nothing, so they never break Claude.
@@ -140,7 +140,7 @@ At runtime, each wrapper execs `node runner.js <event>` and the runtime does one
 1. **SessionStart** (on `claude` launch) — read the shared state from the pinned message.
    - If the account is **already active on a different machine** → send a **⚠️ conflict** notice naming both
      machines and pass context to Claude. The session keeps running normally — nothing is blocked or killed.
-   - Otherwise **acquire the lock**: record `{machine, public IP, city·ISP, session, ts}` into the pinned
+   - Otherwise **acquire the lock**: record `{machine, mid, session, ts}` into the pinned
      message and send a **✅ started** notice.
 2. **PreToolUse** (before every tool call) — heartbeat + conflict reminders.
    - If this session is the **owner** → a throttled heartbeat (at most every ~2 min) refreshes the lock's
@@ -162,7 +162,7 @@ from v1 is removed), and `settings.json` is backed up before every modification.
 | Command | What it does |
 |---|---|
 | `init` | Interactive setup wizard. Flags: `--dry-run` (preview runtime/hook/settings paths, write nothing), `--force` (overwrite existing config without the confirm prompt). Default lock timeout is `600` seconds (10 minutes). |
-| `status` | Show the config summary (masked token, group ID, timeout, machine, pinned-state message id), **hook health** (are the hooks registered? is `runner.js` present?), and the **shared lock table** — which account is active on which machine/IP/location and for how long (read live from the pinned message). |
+| `status` | Show the config summary (masked token, group ID, timeout, machine, pinned-state message id), **hook health** (are the hooks registered? is `runner.js` present?), and the **shared lock table** — which account is active on which machine and for how long (read live from the pinned message). |
 | `test` | Verify the Telegram connection and send a test message to the group. |
 | `pin` | Pin one message of data onto the group, **verbatim**. By default the currently pinned message is edited in place (same `message_id`, so the hook keeps reading it). Flags: `--state` (prepend the `🔒 Claude session locks` header so the runtime parses it as shared lock state — handy for seeding/faking locks when testing conflict enforcement; warns if the JSON doesn't parse as state), `--new` (always send + pin a fresh message instead of editing). |
 | `remove-account <account>` | Remove one account's lock from the pinned shared state — recovery for the **power-loss / crash** case where a machine died without a clean `SessionEnd` and its lock would otherwise linger until the TTL expires. Prints the accounts that do hold locks when the name doesn't match, and posts a 🔓 notice to the group on success. |
@@ -181,7 +181,7 @@ npx claude-session-monitor pin --new 'any data line'
 # Seed/fake lock state (the 🔒 header is prepended automatically) — e.g. to
 # simulate an active session on another machine and test conflict enforcement
 npx claude-session-monitor pin --state \
-  '{"v":1,"accounts":{"you@gmail.com":{"machine":"pc","ip":"1.2.3.4","loc":"Da Nang · ISP","sessions":{"<session-uuid>":1782990021818},"ts":1782990021818}}}'
+  '{"v":1,"accounts":{"you@gmail.com":{"machine":"pc","mid":"a1b2c3d4e5f6a7b8","sessions":{"<session-uuid>":1782990021818},"ts":1782990021818}}}'
 ```
 
 Notes: the bot must be an Admin with the **Pin Messages** permission. Because the default mode edits the

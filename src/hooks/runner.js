@@ -46,11 +46,6 @@ const REMIND_PATH = path.join(CONFIG_DIR, '.remind');
 const NET_TIMEOUT_MS = 6000;
 const WATCHDOG_MS = 9000; // absolute cap so Claude is never blocked by a hang
 
-// Public-IP lookups are cached on disk to avoid hammering (and being banned by)
-// the IP services when many sessions start in a short window.
-const IP_CACHE_PATH = path.join(CONFIG_DIR, '.ipcache');
-const IP_CACHE_TTL_SEC = 900; // 15 minutes
-
 // --------------------------------------------------------------------------
 // small utils
 // --------------------------------------------------------------------------
@@ -196,32 +191,6 @@ function sameHolder(cur, machine, mid) {
 // --------------------------------------------------------------------------
 // network (best-effort; never throws)
 // --------------------------------------------------------------------------
-function httpsGetText(url) {
-  return new Promise((resolve) => {
-    let done = false;
-    const finish = (v) => {
-      if (!done) {
-        done = true;
-        resolve(v);
-      }
-    };
-    try {
-      const req = https.get(url, (res) => {
-        let body = '';
-        res.on('data', (c) => (body += c));
-        res.on('end', () => finish(body.trim()));
-      });
-      req.on('error', () => finish(null));
-      req.setTimeout(NET_TIMEOUT_MS, () => {
-        req.destroy();
-        finish(null);
-      });
-    } catch (_e) {
-      finish(null);
-    }
-  });
-}
-
 function tgApi(token, method, params) {
   return new Promise((resolve) => {
     let done = false;
@@ -269,74 +238,6 @@ function tgApi(token, method, params) {
       finish({ ok: false });
     }
   });
-}
-
-async function getPublicIp() {
-  const ip = await httpsGetText('https://api.ipify.org');
-  if (ip && /^[0-9a-fA-F.:]+$/.test(ip)) return ip;
-  const alt = await httpsGetText('https://checkip.amazonaws.com');
-  return alt && /^[0-9a-fA-F.:]+$/.test(alt) ? alt : '';
-}
-
-async function getGeo(ip) {
-  if (!ip) return '';
-  const raw = await httpsGetText(`https://ipinfo.io/${ip}/json`);
-  if (!raw) return '';
-  try {
-    const j = JSON.parse(raw);
-    const org = (j.org || '').replace(/^AS\d+\s*/, '');
-    return [j.city, org].filter(Boolean).join(' · ');
-  } catch (_e) {
-    return '';
-  }
-}
-
-// --------------------------------------------------------------------------
-// public-IP resolution with a 15-minute on-disk cache (avoids rate-limit bans)
-// --------------------------------------------------------------------------
-function readIpCache() {
-  try {
-    const j = JSON.parse(fs.readFileSync(IP_CACHE_PATH, 'utf8'));
-    if (j && typeof j.ip === 'string') {
-      return { ip: j.ip, loc: j.loc || '', ts: Number(j.ts) || 0 };
-    }
-  } catch (_e) {
-    /* no/invalid cache */
-  }
-  return null;
-}
-
-function writeIpCache(ip, loc) {
-  try {
-    fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(
-      IP_CACHE_PATH,
-      JSON.stringify({ ip, loc: loc || '', ts: nowSec() }),
-      { mode: 0o600 }
-    );
-  } catch (_e) {
-    /* best-effort */
-  }
-}
-
-/**
- * Resolve { ip, loc }, hitting the network at most once per IP_CACHE_TTL_SEC.
- * Falls back to a stale cache entry if a fresh lookup fails.
- */
-async function resolveNetInfo() {
-  const cached = readIpCache();
-  if (cached && nowSec() - cached.ts < IP_CACHE_TTL_SEC) {
-    return { ip: cached.ip, loc: cached.loc };
-  }
-  const ip = await getPublicIp();
-  if (ip) {
-    const loc = await getGeo(ip);
-    writeIpCache(ip, loc);
-    return { ip, loc };
-  }
-  // Fresh lookup failed → reuse the last known IP rather than dropping it.
-  if (cached) return { ip: cached.ip, loc: cached.loc };
-  return { ip: '', loc: '' };
 }
 
 async function notify(cfg, text) {
@@ -558,11 +459,6 @@ async function onSessionStart(cfg, input) {
   const mid = getMachineId();
   const sessionId = input.session_id || 'unknown';
 
-  // Resolved for DISPLAY only (Telegram/history show where the machine is). The
-  // holder identity is the stable MAC-derived `mid`, not the IP — the IP can
-  // switch between two office links on one machine. Cached on disk for 15 min.
-  const { ip, loc } = await resolveNetInfo();
-
   const { state, messageId, pinned } = await readState(cfg);
   const cur = state.accounts[account];
   const age = nowSec() - (Number(cur && cur.ts) || 0);
@@ -585,13 +481,12 @@ async function onSessionStart(cfg, input) {
   if (liveConflict) {
     writeMarker(sessionId, 'conflict');
     writeRemindTs(); // the start notice counts as the first reminder
-    appendHistory('CONFLICT', `holder=${cur.machine}/${cur.ip || '?'}`);
+    appendHistory('CONFLICT', `holder=${cur.machine}`);
     await notify(
       cfg,
       `⚠️ <b>Conflict</b>\n` +
-        `Account <b>${esc(account)}</b> đang được dùng ở <b>${esc(cur.machine)}</b>` +
-        ` (${esc(cur.ip || '?')}${cur.loc ? ' · ' + esc(cur.loc) : ''}).\n` +
-        `Máy <b>${esc(machine)}</b> (${esc(ip || '?')}) vừa mở thêm một phiên Claude.`
+        `Account <b>${esc(account)}</b> đang được dùng ở <b>${esc(cur.machine)}</b>.\n` +
+        `Máy <b>${esc(machine)}</b> vừa mở thêm một phiên Claude.`
     );
     // Surface the concurrent usage so Claude can mention it to the user.
     process.stdout.write(
@@ -599,7 +494,7 @@ async function onSessionStart(cfg, input) {
         hookSpecificOutput: {
           hookEventName: 'SessionStart',
           additionalContext:
-            `claude-session-monitor: account ${account} is also active on ${cur.machine} (${cur.ip || 'unknown ip'}). ` +
+            `claude-session-monitor: account ${account} is also active on ${cur.machine}. ` +
             `A conflict notification was sent to the Telegram group (and will repeat while the conflict lasts); ` +
             `this session is NOT blocked.`,
         },
@@ -612,7 +507,7 @@ async function onSessionStart(cfg, input) {
   // sessions, and announce the takeover so the group sees the machine change.
   const staleHolder = active && !ours ? cur.machine : null;
   if (staleHolder) {
-    appendHistory('TAKEOVER', `stale holder=${staleHolder}/${cur.ip || '?'}, age=${age}s`);
+    appendHistory('TAKEOVER', `stale holder=${staleHolder}, age=${age}s`);
   }
 
   // Free (or same machine) → acquire or join the lock. The lock is
@@ -626,22 +521,19 @@ async function onSessionStart(cfg, input) {
   state.accounts[account] = {
     machine,
     mid,
-    ip: ip || '',
-    loc: loc || '',
     sessions,
     ts: nowSec(),
   };
   await writeState(cfg, state, messageId, !pinned);
   writeMarker(sessionId, 'owner');
   if (isFirst) {
-    appendHistory('START', `${ip || '?'}${loc ? ' · ' + loc : ''}`);
+    appendHistory('START', '');
     await notify(
       cfg,
       staleHolder
         ? `♻️ <b>${esc(account)}</b> tiếp quản lock (holder cũ <b>${esc(staleHolder)}</b> stale)` +
-            ` @ <b>${esc(machine)}</b> (${esc(ip || '?')}${loc ? ' · ' + esc(loc) : ''}).`
-        : `✅ <b>${esc(account)}</b> mở session @ <b>${esc(machine)}</b>` +
-            ` (${esc(ip || '?')}${loc ? ' · ' + esc(loc) : ''}).`
+            ` @ <b>${esc(machine)}</b>.`
+        : `✅ <b>${esc(account)}</b> mở session @ <b>${esc(machine)}</b>.`
     );
   }
   return 0;
@@ -659,7 +551,6 @@ async function onPreToolUse(cfg, input) {
       const account = getAccount();
       const machine = getMachine();
       const mid = getMachineId();
-      const { ip, loc } = await resolveNetInfo();
       const { state, messageId, pinned } = await readState(cfg);
       const cur = state.accounts[account];
       const age = nowSec() - (Number(cur && cur.ts) || 0);
@@ -670,13 +561,12 @@ async function onPreToolUse(cfg, input) {
         // conflicted sessions here share the REMIND_PATH throttle.
         if (nowSec() - readRemindTs() >= CONFLICT_REMIND_SEC) {
           writeRemindTs();
-          appendHistory('CONFLICT', `holder=${cur.machine}/${cur.ip || '?'} (reminder)`);
+          appendHistory('CONFLICT', `holder=${cur.machine} (reminder)`);
           await notify(
             cfg,
             `⚠️ <b>Conflict (nhắc lại)</b>\n` +
               `Account <b>${esc(account)}</b> vẫn đang được dùng ở <b>${esc(cur.machine)}</b>` +
-              ` (${esc(cur.ip || '?')}${cur.loc ? ' · ' + esc(cur.loc) : ''})` +
-              ` trong khi máy <b>${esc(machine)}</b> (${esc(ip || '?')}) cũng đang chạy.`
+              ` trong khi máy <b>${esc(machine)}</b> cũng đang chạy.`
           );
         }
       } else {
@@ -688,19 +578,17 @@ async function onPreToolUse(cfg, input) {
         state.accounts[account] = {
           machine,
           mid,
-          ip: ip || '',
-          loc: loc || '',
           sessions,
           ts: nowSec(),
         };
         await writeState(cfg, state, messageId, !pinned);
         writeMarker(sessionId, 'owner');
         if (isFirst) {
-          appendHistory('START', `${ip || '?'}${loc ? ' · ' + loc : ''} (after conflict)`);
+          appendHistory('START', '(after conflict)');
           await notify(
             cfg,
             `✅ <b>${esc(account)}</b> mở session @ <b>${esc(machine)}</b>` +
-              ` (${esc(ip || '?')}${loc ? ' · ' + esc(loc) : ''}) — conflict trước đó đã kết thúc.`
+              ` — conflict trước đó đã kết thúc.`
           );
         }
       }
@@ -716,19 +604,17 @@ async function onPreToolUse(cfg, input) {
     try {
       const account = getAccount();
       const mid = getMachineId();
-      const { ip, loc } = await resolveNetInfo();
       const { state, messageId, pinned } = await readState(cfg);
       const cur = state.accounts[account];
       // `!cur` self-heals a LOST state (someone unpinned/deleted the state
       // message): this session verifiably owns the lock (owner marker), so its
       // entry is rebuilt and the write below re-pins the state message.
       if (!cur || sameHolder(cur, getMachine(), mid)) {
-        const entry = cur || { machine: getMachine(), mid, ip: ip || '', loc: loc || '' };
+        const entry = cur || { machine: getMachine(), mid };
         const sessions = liveSessions(cur, cfg.ttl);
         sessions[sessionId] = nowSec(); // refresh (or revive) this session
         entry.sessions = sessions;
         delete entry.session; // drop the legacy single-session field
-        if (ip && !entry.ip) entry.ip = ip; // backfill an IP the start-time lookup missed
         if (mid && !entry.mid) entry.mid = mid; // backfill mid on a legacy entry
         entry.ts = nowSec();
         state.accounts[account] = entry;
@@ -830,8 +716,6 @@ module.exports = {
   TTL_FLOOR_SEC,
   CONFLICT_REMIND_SEC,
   REMIND_PATH,
-  IP_CACHE_PATH,
-  IP_CACHE_TTL_SEC,
   esc,
   markerPath,
   decryptToken,
@@ -851,9 +735,6 @@ module.exports = {
   readRemindTs,
   writeRemindTs,
   appendHistory,
-  readIpCache,
-  writeIpCache,
-  resolveNetInfo,
   onSessionStart,
   onPreToolUse,
   onSessionEnd,

@@ -66,12 +66,11 @@ function printHookHealth() {
 /**
  * Render one active-account row from the shared state.
  * @param {string} account
- * @param {object} info { machine, ip, loc, ts }
+ * @param {object} info { machine, ts }
  * @param {number} nowSeconds
  */
 function printAccountRow(account, info, nowSeconds) {
   const machine = info.machine || 'unknown';
-  const where = [info.ip, info.loc].filter(Boolean).join(' · ') || chalk.dim('unknown');
   const ts = Number(info.ts);
   const age = Number.isFinite(ts) ? formatDuration(nowSeconds - ts) : chalk.dim('unknown');
   const sessionCount =
@@ -83,7 +82,6 @@ function printAccountRow(account, info, nowSeconds) {
 
   console.log(`  ${chalk.bold(account)}`);
   row('  Machine', machine);
-  row('  Location', where);
   row('  Sessions', String(sessionCount));
   row('  Active for', age);
 }
