@@ -43,6 +43,22 @@ const CONFLICT_REMIND_SEC = 300; // re-notify a live conflict at most every 5 mi
 // Machine-wide throttle for conflict reminders: several conflicted sessions on
 // the same machine must not each post their own reminder.
 const REMIND_PATH = path.join(CONFIG_DIR, '.remind');
+
+// Machine-local session bookkeeping. The pinned Telegram message is a slow,
+// shared store: when several Claude sessions launch on ONE machine at almost the
+// same instant they all read the state before any of them has written it back,
+// so each believes it is the first and each posts its own ✅ — a notification
+// storm. These local files are the source of truth for "how many sessions are
+// live on THIS machine" and gate the open/close notifications atomically via the
+// filesystem, independent of the remote round-trip.
+//   - ACTIVE_DIR: one file per live owner session on this machine (name = safe
+//     session id, contents = last-seen epoch). Its size is the local refcount.
+//   - OPEN_NOTICE_PATH: a single machine-wide flag that exists exactly while a ✅
+//     "session opened" notice is outstanding. Created with an exclusive `wx`
+//     write so only ONE of N concurrent starters wins and notifies; removed with
+//     a single unlink so only ONE of N concurrent enders posts the 👋.
+const ACTIVE_DIR = path.join(CONFIG_DIR, 'active');
+const OPEN_NOTICE_PATH = path.join(CONFIG_DIR, '.opennotice');
 const NET_TIMEOUT_MS = 6000;
 const WATCHDOG_MS = 9000; // absolute cap so Claude is never blocked by a hang
 
@@ -411,6 +427,97 @@ function writeRemindTs() {
 }
 
 // --------------------------------------------------------------------------
+// machine-local session refcount + atomic open/close notification gate
+// --------------------------------------------------------------------------
+function activePath(sessionId) {
+  const safe = String(sessionId || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '_');
+  return path.join(ACTIVE_DIR, safe);
+}
+
+// Register (or refresh the heartbeat of) this session in the local active set.
+function localActiveAdd(sessionId) {
+  try {
+    fs.mkdirSync(ACTIVE_DIR, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(activePath(sessionId), `${nowSec()}\n`, { mode: 0o600 });
+  } catch (_e) {
+    /* best-effort */
+  }
+}
+
+function localActiveRemove(sessionId) {
+  try {
+    fs.unlinkSync(activePath(sessionId));
+  } catch (_e) {
+    /* best-effort */
+  }
+}
+
+/**
+ * Number of sessions still live on THIS machine, pruning entries whose last
+ * heartbeat is older than `ttl` (a crashed session that never sent SessionEnd).
+ */
+function localActiveCount(ttl) {
+  let n = 0;
+  let names;
+  try {
+    names = fs.readdirSync(ACTIVE_DIR);
+  } catch (_e) {
+    return 0; // dir absent → nothing active
+  }
+  for (const name of names) {
+    const p = path.join(ACTIVE_DIR, name);
+    try {
+      const ts = parseInt(fs.readFileSync(p, 'utf8'), 10) || 0;
+      if (nowSec() - ts < ttl) n += 1;
+      else fs.unlinkSync(p); // prune a stale (crashed) session
+    } catch (_e) {
+      /* unreadable entry → ignore */
+    }
+  }
+  return n;
+}
+
+/**
+ * Claim the right to post the ✅ "opened" notice for this machine. Returns true
+ * for exactly ONE caller while no notice is outstanding: the exclusive `wx`
+ * write means concurrent starters race on the filesystem, not over the network.
+ * A notice left behind by a crash (older than `ttl`) is treated as orphaned and
+ * re-claimed so the machine is not muted forever.
+ */
+function claimOpenNotice(ttl) {
+  try {
+    fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(OPEN_NOTICE_PATH, `${nowSec()}\n`, { flag: 'wx', mode: 0o600 });
+    return true;
+  } catch (_e) {
+    try {
+      const ts = parseInt(fs.readFileSync(OPEN_NOTICE_PATH, 'utf8'), 10) || 0;
+      if (nowSec() - ts > ttl) {
+        fs.writeFileSync(OPEN_NOTICE_PATH, `${nowSec()}\n`, { mode: 0o600 });
+        return true; // orphaned notice → re-claim
+      }
+    } catch (_e2) {
+      /* unreadable → treat as already claimed */
+    }
+    return false;
+  }
+}
+
+/**
+ * Clear the outstanding open notice. Returns true for exactly ONE caller (the
+ * unlink succeeds once), so only that caller posts the 👋 "closed" notice even
+ * when several sessions end at the same instant.
+ */
+function releaseOpenNotice() {
+  try {
+    fs.unlinkSync(OPEN_NOTICE_PATH);
+    return true;
+  } catch (_e) {
+    return false;
+  }
+}
+
+// --------------------------------------------------------------------------
 // local history (tab-separated, same format as src/services/config.js so the
 // `logs` CLI command can read entries written by this standalone runner)
 // --------------------------------------------------------------------------
@@ -510,12 +617,9 @@ async function onSessionStart(cfg, input) {
     appendHistory('TAKEOVER', `stale holder=${staleHolder}, age=${age}s`);
   }
 
-  // Free (or same machine) → acquire or join the lock. The lock is
-  // reference-counted per session: only the FIRST session notifies; extra
-  // sessions on the same machine just register silently. A stale holder on
-  // another machine is dropped (its sessions are not carried over).
+  // Free (or same machine) → acquire or join the lock. A stale holder on another
+  // machine is dropped (its sessions are not carried over).
   const sessions = liveSessions(active && ours ? cur : null, cfg.ttl);
-  const isFirst = Object.keys(sessions).length === 0;
   sessions[sessionId] = nowSec();
 
   state.accounts[account] = {
@@ -526,7 +630,13 @@ async function onSessionStart(cfg, input) {
   };
   await writeState(cfg, state, messageId, !pinned);
   writeMarker(sessionId, 'owner');
-  if (isFirst) {
+
+  // Notify ONCE per machine-active period. The local refcount is the source of
+  // truth: register this session, then let exactly one concurrent starter win
+  // the open-notice claim. Extra sessions (whether they launched together or
+  // joined later) register silently instead of each posting their own ✅.
+  localActiveAdd(sessionId);
+  if (claimOpenNotice(cfg.ttl)) {
     appendHistory('START', '');
     await notify(
       cfg,
@@ -573,7 +683,6 @@ async function onPreToolUse(cfg, input) {
         // The other machine released / went stale → this session takes the
         // lock over and becomes a normal owner (reminders stop).
         const sessions = liveSessions(cur && ours ? cur : null, cfg.ttl);
-        const isFirst = Object.keys(sessions).length === 0;
         sessions[sessionId] = nowSec();
         state.accounts[account] = {
           machine,
@@ -583,7 +692,8 @@ async function onPreToolUse(cfg, input) {
         };
         await writeState(cfg, state, messageId, !pinned);
         writeMarker(sessionId, 'owner');
-        if (isFirst) {
+        localActiveAdd(sessionId);
+        if (claimOpenNotice(cfg.ttl)) {
           appendHistory('START', '(after conflict)');
           await notify(
             cfg,
@@ -601,6 +711,7 @@ async function onPreToolUse(cfg, input) {
   // Owner → throttled remote heartbeat to keep the lock alive during long work.
   if (m && m.role === 'owner' && nowSec() - m.ts >= HEARTBEAT_SEC) {
     writeMarker(sessionId, 'owner'); // refresh local ts first (fast)
+    localActiveAdd(sessionId); // keep this session from being pruned as stale
     try {
       const account = getAccount();
       const mid = getMachineId();
@@ -637,6 +748,12 @@ async function onSessionEnd(cfg, input) {
   // registered owns nothing).
   if (!m || m.role !== 'owner') return 0;
 
+  // Drop this session from the local refcount first. Whether the group is
+  // notified is decided by the LOCAL count, so the 👋 fires exactly once — when
+  // the LAST session on this machine ends — no matter how the remote state races.
+  localActiveRemove(sessionId);
+  const stillActiveLocally = localActiveCount(cfg.ttl) > 0;
+
   try {
     const account = getAccount();
     const machine = getMachine();
@@ -648,7 +765,7 @@ async function onSessionEnd(cfg, input) {
     const sessions = liveSessions(cur, cfg.ttl);
     delete sessions[sessionId];
 
-    if (Object.keys(sessions).length > 0) {
+    if (stillActiveLocally) {
       // Other sessions on this machine are still open → keep the lock, no noti.
       cur.sessions = sessions;
       delete cur.session; // drop the legacy single-session field
@@ -656,11 +773,15 @@ async function onSessionEnd(cfg, input) {
       return 0;
     }
 
-    // Last session closed → release the lock and notify once.
+    // Last session on this machine closed → release the lock. Only the caller
+    // that clears the open-notice flag posts the 👋, so concurrent ends collapse
+    // to a single "closed" notice.
     delete state.accounts[account];
     await writeState(cfg, state, messageId, !pinned);
-    appendHistory('END', '');
-    await notify(cfg, `👋 <b>${esc(account)}</b> đóng session @ <b>${esc(machine)}</b>.`);
+    if (releaseOpenNotice()) {
+      appendHistory('END', '');
+      await notify(cfg, `👋 <b>${esc(account)}</b> đóng session @ <b>${esc(machine)}</b>.`);
+    }
   } catch (_e) {
     /* best-effort cleanup */
   }
@@ -716,6 +837,8 @@ module.exports = {
   TTL_FLOOR_SEC,
   CONFLICT_REMIND_SEC,
   REMIND_PATH,
+  ACTIVE_DIR,
+  OPEN_NOTICE_PATH,
   esc,
   markerPath,
   decryptToken,
@@ -734,6 +857,11 @@ module.exports = {
   removeMarker,
   readRemindTs,
   writeRemindTs,
+  localActiveAdd,
+  localActiveRemove,
+  localActiveCount,
+  claimOpenNotice,
+  releaseOpenNotice,
   appendHistory,
   onSessionStart,
   onPreToolUse,

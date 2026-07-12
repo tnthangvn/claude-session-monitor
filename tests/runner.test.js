@@ -450,6 +450,14 @@ describe('onSessionStart — lock check against the pinned state message', () =>
 
   const sent = (method) => apiCalls.filter((c) => c.method === method);
 
+  // Simulate that another Claude session already opened on THIS machine: it
+  // registered in the local refcount and claimed the open-notice. A new session
+  // that then joins must stay silent (the ✅ was already posted for this period).
+  const simulateMachineAlreadyOpen = (otherId = 'other-live') => {
+    runner.localActiveAdd(otherId);
+    runner.claimOpenNotice(TTL);
+  };
+
   // Drives the real handler with the runtime's own decrypted config.
   const runnerOnSessionStart = (input) =>
     runner.onSessionStart(runner.loadConfig(), input);
@@ -531,10 +539,10 @@ describe('onSessionStart — lock check against the pinned state message', () =>
   });
 
   test('lock held by THIS machine (same hostname AND same IP) → joins silently, no kill, no notify', async () => {
-    // Arrange — same hostname, same public IP (the cached 203.0.113.7),
-    // another live session already refcounted.
+    // Arrange — same hostname, another live session already open on this machine.
     const now = Math.floor(Date.now() / 1000);
     const id = freshSessionId();
+    simulateMachineAlreadyOpen();
     mockTelegram(
       pinnedChat({
         v: 1,
@@ -747,6 +755,7 @@ describe('onSessionStart — lock check against the pinned state message', () =>
     // conflict; MAC-based identity recognises the same mid and joins silently.
     const id = freshSessionId();
     const nic = withFakeNic('aa:bb:cc:dd:ee:01');
+    simulateMachineAlreadyOpen();
     mockTelegram(
       pinnedChat(realWorldState({ machine: os.hostname(), mid: nic.mid, ip: '116.110.29.22' }))
     );
@@ -769,6 +778,7 @@ describe('onSessionStart — lock check against the pinned state message', () =>
     // conflict from missing data — hostname comparison decides alone.
     const now = Math.floor(Date.now() / 1000);
     const id = freshSessionId();
+    simulateMachineAlreadyOpen();
     mockTelegram(
       pinnedChat({
         v: 1,
@@ -800,6 +810,7 @@ describe('onSessionStart — lock check against the pinned state message', () =>
     // No usable local IP: hostname comparison decides.
     const now = Math.floor(Date.now() / 1000);
     const id = freshSessionId();
+    simulateMachineAlreadyOpen();
     mockTelegram(
       pinnedChat({
         v: 1,
@@ -1072,5 +1083,165 @@ describe('onPreToolUse — conflict reminders (notify-only spam guard)', () => {
     expect(Object.keys(written.accounts[ACCOUNT].sessions)).toEqual([id]);
 
     runner.removeMarker(id);
+  });
+});
+
+// --------------------------------------------------------------------------
+// The core fix for the "notification storm": several Claude sessions launching
+// on ONE machine must not each post a ✅, and the 👋 must fire only once — when
+// the LAST of them ends. The gate is a machine-local refcount + an atomic
+// open-notice flag, so it holds even when the slow pinned-message round-trip
+// races (every concurrent starter reads the state while it is still empty).
+// --------------------------------------------------------------------------
+describe('notify once per machine-active period (local refcount gate)', () => {
+  const ACCOUNT = 'x@y.com';
+  const TTL = 1800; // runnerConfig() timeout
+
+  let apiCalls;
+  let stored; // the current in-memory "pinned" state object (null = nothing pinned)
+  let killSpy;
+  let stdoutSpy;
+
+  // A STATEFUL fake Telegram transport: getChat returns whatever the last
+  // editMessageText / fresh sendMessage stored, so the refcount can be exercised
+  // across a real start→end lifecycle.
+  function mockStatefulTelegram() {
+    jest.spyOn(https, 'request').mockImplementation((options, cb) => {
+      let body = '';
+      const req = {
+        on: () => req,
+        setTimeout: () => req,
+        destroy: () => {},
+        write: (chunk) => {
+          body += chunk;
+        },
+        end: () => {
+          const method = String(options.path).split('/').pop();
+          const params = body ? JSON.parse(body) : {};
+          apiCalls.push({ method, params });
+          const parseState = (t) => {
+            const i = String(t || '').indexOf('{');
+            return i >= 0 ? JSON.parse(String(t).slice(i)) : null;
+          };
+          let result = { ok: true, result: {} };
+          if (method === 'getChat') {
+            result = stored
+              ? {
+                  ok: true,
+                  result: {
+                    pinned_message: {
+                      message_id: 555,
+                      text: `${runner.STATE_HEADER}\n${JSON.stringify(stored)}`,
+                    },
+                  },
+                }
+              : { ok: true, result: {} };
+          } else if (method === 'editMessageText') {
+            const s = parseState(params.text);
+            if (s) stored = s;
+            result = { ok: true, result: { message_id: params.message_id || 555 } };
+          } else if (method === 'sendMessage') {
+            if (params.disable_notification) {
+              const s = parseState(params.text); // a fresh state message
+              if (s) stored = s;
+              result = { ok: true, result: { message_id: 555 } };
+            } else {
+              result = { ok: true, result: { message_id: 1 } }; // a human-facing notice
+            }
+          }
+          const res = new EventEmitter();
+          cb(res);
+          process.nextTick(() => {
+            res.emit('data', JSON.stringify(result));
+            res.emit('end');
+          });
+        },
+      };
+      return req;
+    });
+  }
+
+  // Human-facing notices only (the silent disable_notification state writes are
+  // bookkeeping, not what the group sees).
+  const notices = () =>
+    apiCalls.filter((c) => c.method === 'sendMessage' && !c.params.disable_notification);
+  const withEmoji = (e) => notices().filter((c) => String(c.params.text).includes(e));
+
+  beforeEach(() => {
+    apiCalls = [];
+    stored = null;
+    config.saveConfig(runnerConfig());
+    fs.writeFileSync(CLAUDE_JSON, JSON.stringify({ oauthAccount: { emailAddress: ACCOUNT } }));
+    killSpy = jest.spyOn(process, 'kill').mockImplementation(() => true);
+    stdoutSpy = jest.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    mockStatefulTelegram();
+  });
+
+  afterEach(() => {
+    killSpy.mockRestore();
+    stdoutSpy.mockRestore();
+    https.request.mockRestore();
+  });
+
+  test('claimOpenNotice wins once; releaseOpenNotice clears it once', () => {
+    expect(runner.claimOpenNotice(TTL)).toBe(true); // first claimer wins
+    expect(runner.claimOpenNotice(TTL)).toBe(false); // notice already outstanding
+    expect(runner.releaseOpenNotice()).toBe(true); // cleared by exactly one caller
+    expect(runner.releaseOpenNotice()).toBe(false); // nothing left to clear
+    expect(runner.claimOpenNotice(TTL)).toBe(true); // can be claimed again next period
+  });
+
+  test('three sessions that all read empty state post exactly one ✅', async () => {
+    // Arrange — the race: each start observes the pinned message while it is
+    // still empty (resetting `stored` before each call), the exact condition
+    // that made every session think it was the first.
+    const cfg = runner.loadConfig();
+    const ids = [freshSessionId(), freshSessionId(), freshSessionId()];
+
+    // Act
+    for (const id of ids) {
+      stored = null;
+      await runner.onSessionStart(cfg, { session_id: id });
+    }
+
+    // Assert — one ✅ for the whole burst, all three counted locally.
+    expect(withEmoji('✅')).toHaveLength(1);
+    expect(runner.localActiveCount(TTL)).toBe(3);
+
+    ids.forEach((id) => runner.removeMarker(id));
+  });
+
+  test('👋 fires only when the LAST of several sessions ends', async () => {
+    // Arrange — three sessions open on this machine (one ✅).
+    const cfg = runner.loadConfig();
+    const ids = [freshSessionId(), freshSessionId(), freshSessionId()];
+    for (const id of ids) await runner.onSessionStart(cfg, { session_id: id });
+    expect(withEmoji('✅')).toHaveLength(1);
+    apiCalls.length = 0; // focus assertions on the close phase
+
+    // Act + Assert — the first two ends are silent…
+    await runner.onSessionEnd(cfg, { session_id: ids[0] });
+    await runner.onSessionEnd(cfg, { session_id: ids[1] });
+    expect(withEmoji('👋')).toHaveLength(0);
+    expect(runner.localActiveCount(TTL)).toBe(1);
+
+    // …only the last end posts the single 👋.
+    await runner.onSessionEnd(cfg, { session_id: ids[2] });
+    expect(withEmoji('👋')).toHaveLength(1);
+    expect(runner.localActiveCount(TTL)).toBe(0);
+  });
+
+  test('a fresh session after everyone left opens a new period with its own ✅', async () => {
+    const cfg = runner.loadConfig();
+    const a = freshSessionId();
+    await runner.onSessionStart(cfg, { session_id: a });
+    await runner.onSessionEnd(cfg, { session_id: a });
+    expect(withEmoji('✅')).toHaveLength(1);
+    expect(withEmoji('👋')).toHaveLength(1);
+
+    const b = freshSessionId();
+    await runner.onSessionStart(cfg, { session_id: b });
+    expect(withEmoji('✅')).toHaveLength(2); // a genuinely new active period
+    runner.removeMarker(b);
   });
 });

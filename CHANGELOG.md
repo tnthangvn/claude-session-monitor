@@ -3,6 +3,26 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.7] - 2026-07-11
+
+### Fixed
+
+- **Notification storm on one machine.** When several Claude sessions launched on
+  the same machine at nearly the same moment, each read the pinned Telegram state
+  while it was still empty and every one posted its own `✅ mở session` — a burst
+  of duplicate notices. Sessions are now reference-counted with machine-local
+  files and the open notice is gated by an atomic filesystem flag, so a burst of
+  concurrent starts produces exactly **one** `✅`, and the `👋 đóng session`
+  notice fires **once**, only when the **last** session on the machine ends.
+
+### Notes
+
+- The gate is machine-local (`~/.claude/session-monitor/active/` +
+  `.opennotice`); it does not depend on the slow shared round-trip, so it is
+  race-proof for same-machine concurrency. Cross-machine conflict warnings (⚠️)
+  are unchanged.
+- Run `claude-session-monitor upgrade` on each machine to pick up the new runtime.
+
 ## [1.2.6] - 2026-07-11
 
 ### Changed
