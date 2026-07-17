@@ -33,6 +33,7 @@ function section(title) {
  */
 function printConfig(cfg) {
   section('Configuration');
+  row('Version', require('../../package.json').version);
   row('Bot token', maskToken(cfg.botToken));
   row('Group ID', String(cfg.groupId));
   row('Timeout', `${cfg.timeout}s`);
@@ -66,24 +67,36 @@ function printHookHealth() {
 /**
  * Render one active-account row from the shared state.
  * @param {string} account
- * @param {object} info { machine, ts }
+ * @param {object} info { machine, mid, exp }
  * @param {number} nowSeconds
  */
 function printAccountRow(account, info, nowSeconds) {
   const machine = info.machine || 'unknown';
+  // Current entries carry an absolute `exp` (epoch MS). Legacy entries only had
+  // `ts` (epoch seconds); fall back to showing how long ago it was seen.
+  const exp = Number(info.exp);
   const ts = Number(info.ts);
-  const age = Number.isFinite(ts) ? formatDuration(nowSeconds - ts) : chalk.dim('unknown');
+  let freshness;
+  if (Number.isFinite(exp)) {
+    freshness = `${formatDuration(Math.max(0, Math.floor(exp / 1000) - nowSeconds))} left`;
+  } else if (Number.isFinite(ts)) {
+    freshness = `${formatDuration(nowSeconds - ts)} ago`;
+  } else {
+    freshness = chalk.dim('unknown');
+  }
+  // The pinned state no longer carries per-session details, so a count is shown
+  // ONLY for legacy entries that still have it.
   const sessionCount =
     info.sessions && typeof info.sessions === 'object'
       ? Object.keys(info.sessions).length
       : info.session
         ? 1
-        : 0;
+        : null;
 
   console.log(`  ${chalk.bold(account)}`);
   row('  Machine', machine);
-  row('  Sessions', String(sessionCount));
-  row('  Active for', age);
+  if (sessionCount !== null) row('  Sessions', String(sessionCount));
+  row('  Expires in', freshness);
 }
 
 /**

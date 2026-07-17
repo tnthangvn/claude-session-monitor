@@ -3,7 +3,47 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [1.2.7] - 2026-07-11
+## [1.2.9] - 2026-07-17
+
+### Changed
+
+- **Pinned state is minimal per account: `{machine, mid, exp}`.** The per-session
+  UUID map (`sessions`) is no longer written to the pinned Telegram message —
+  live sessions are counted in a machine-local refcount
+  (`~/.claude/session-monitor/active/`) instead. This stops the pinned message
+  from bloating with a new UUID for every concurrent session.
+- **Lock freshness now uses a holder-declared absolute expiry `exp`.** The holder
+  stamps `exp = now + timeout` (epoch **milliseconds**) on the pinned message; a
+  reader treats the lock as live while `Date.now() < exp` — judged by the
+  **holder's** timeout, not the reader's. This fixes an early takeover when two
+  machines ran different `timeout` values (e.g. a machine with `timeout=3600`
+  was stolen after ~10 min by one with `timeout=600`).
+- **`ttl` now equals the configured `timeout` verbatim.** The 600s floor and the
+  reader-side `TTL_FLOOR_SEC` grace window were removed from the active/conflict
+  logic (the constant remains for compatibility).
+- **Heartbeat remote refreshes are coalesced machine-wide** (`.pushed`): with N
+  live sessions, only one `editMessageText` per 120s window extends the shared
+  `exp`. The local refcount still refreshes per session.
+- **`status`** shows *"Expires in"* (derived from `exp`) instead of *"Active
+  for"*; a session count is shown only for legacy entries that still carry one.
+
+### Notes
+
+- A holder still inside its window is **protected**: a second machine posts a
+  `⚠️` conflict warning (read-only) instead of stealing the lock.
+- A **crashed** holder is taken over only after its `exp` passes (last heartbeat
+  + `timeout`) — choose a smaller `timeout` for faster crash recovery.
+- Legacy entries (with `ts` / `sessions`) still resolve via a fallback and
+  self-migrate to the minimal shape on their next write.
+- Cross-machine TOCTOU on the shared pinned message is still not addressed (needs
+  a truly atomic store); only same-machine races are eliminated.
+- Run `claude-session-monitor upgrade` on each machine to copy the new runtime
+  into `~/.claude/session-monitor/runner.js`.
+
+## [1.2.8] - 2026-07-11
+
+> Published to npm as `1.2.8` (the `1.2.7` tag was never published — npm went
+> `1.2.6` → `1.2.8`).
 
 ### Fixed
 

@@ -16,16 +16,18 @@ function esc(s) {
     .replace(/>/g, '&gt;');
 }
 
-/** One-line description of a lock entry: machine (ip · loc), N session(s). */
+/** One-line description of a lock entry: machine (ip · loc)[, N session(s)]. */
 function describeEntry(entry) {
   const where = [entry.ip, entry.loc].filter(Boolean).join(' · ');
+  // Current entries carry no per-session map; only legacy ones still have a count.
   const sessions =
     entry.sessions && typeof entry.sessions === 'object'
       ? Object.keys(entry.sessions).length
       : entry.session
         ? 1
-        : 0;
-  return `${entry.machine || '?'}${where ? ` (${where})` : ''}, ${sessions} session(s)`;
+        : null;
+  const suffix = sessions === null ? '' : `, ${sessions} session(s)`;
+  return `${entry.machine || '?'}${where ? ` (${where})` : ''}${suffix}`;
 }
 
 /**

@@ -8,14 +8,30 @@
 
 | Hằng số | Giá trị | Ý nghĩa |
 |---|---|---|
-| `HEARTBEAT_SEC` | 120s | Khoảng tối thiểu giữa 2 lần refresh `ts` remote (từ PreToolUse) |
-| `TTL_FLOOR_SEC` | 600s | Sàn cứng: lock được coi là "active" tối thiểu 10 phút không hoạt động |
-| `ttl` | `max(timeout, 600)` | `timeout` nhập lúc init; init default 1800s, config default 300s (bị floor lên 600) |
+| `HEARTBEAT_SEC` | 120s | Cửa sổ gộp: refresh `exp` remote tối đa 1 lần/window, machine-wide (`.pushed`) |
+| `ttl` | `= timeout` | Lấy thẳng `config.timeout` (bỏ floor). Dùng để tính `exp` và prune `ACTIVE_DIR` cục bộ |
 | `NET_TIMEOUT_MS` | 6000ms | Timeout mỗi request mạng |
 | `WATCHDOG_MS` | 9000ms | Cap tuyệt đối: nếu treo → exit 0 |
-| `IP_CACHE_TTL_SEC` | 900s | Cache IP công khai trên đĩa 15 phút |
+
+> `TTL_FLOOR_SEC` (600s) **không còn dùng trong logic** — thay bằng mô hình `exp` tuyệt đối (xem mục dưới). Hằng số còn giữ để tương thích.
 
 Hook được đăng ký: **SessionStart**, **PreToolUse**, **SessionEnd** (không có `UserPromptSubmit`).
+
+---
+
+## Freshness theo `exp` tuyệt đối (holder tự khai hạn)
+
+**Vấn đề cũ:** remote chỉ lưu `ts = now`, reader (máy B) so `now - ts < cfg.ttl` bằng **ttl của B**. Máy A timeout 3600, B timeout 600 → B tưởng A chết sau 10 phút → cướp lock sớm sai.
+
+**Fix:** holder ghi **`exp = now + timeout`** (epoch **mili giây**) lên pin. Reader chỉ so **`Date.now() < cur.exp`** — hạn do HOLDER khai, không đụng config của reader.
+
+- Entry remote tối giản: **`{machine, mid, exp}`** (account = key email).
+- `active = Date.now() < cur.exp` (fallback `cur.ts` giây cho entry cũ).
+- `liveConflict = active && !ours` → ⚠️ cảnh báo (read-only, không cướp).
+- Holder **hết hạn** (`!active`) & khác máy → `staleHolder` → ♻️ tiếp quản.
+- **Bỏ floor**: holder còn trong window luôn được bảo vệ; đổi lại holder crash phải chờ tới `exp` (last heartbeat + timeout) mới bị cướp — muốn cướp nhanh thì đặt `timeout` nhỏ.
+
+**Refresh `exp` khi nhiều session live:** heartbeat (PreToolUse, mỗi session throttle 120s local) nhưng **push remote gộp machine-wide** qua `.pushed` — chỉ 1 session/120s ghi `editMessageText`, cả máy chung 1 `exp`. `ACTIVE_DIR` vẫn refresh per-session để đếm refcount chính xác.
 
 ---
 
@@ -154,8 +170,8 @@ flowchart LR
 | 1 | SessionStart không hard-block được | Sơ đồ 2, B4 | Turn đầu / text thuần vẫn gọi model → dùng song song khác IP |
 | 2 | Owner mất lock không tự demote | Sơ đồ 3, R5 | Lock stale bị cướp → 2 máy chạy song song |
 | 3 | Heartbeat đo tool call, không đo model call | onPreToolUse | Session tốn token nhưng lock tưởng im lặng → có thể stale |
-| 4 | `editMessageText` không atomic | writeState | TOCTOU race: 2 máy cùng thấy "free" rồi cùng giành lock |
-| 5 | Default `timeout` lệch giữa init (1800) và config (300) | init.js / config.js | Khó hiểu; config bị floor lên 600 lúc runtime |
+| 4 | `editMessageText` không atomic | writeState | TOCTOU race **cross-machine** vẫn còn (cần store atomic). Race **cùng máy** đã hết: refcount ở `ACTIVE_DIR`, gate noti ở `OPEN_NOTICE`, remote entry `{machine,mid,exp}` idempotent |
+| 5 | ~~Reader phán stale bằng ttl của chính nó~~ | ĐÃ FIX | Chuyển sang `exp` tuyệt đối holder khai; bỏ floor; `ttl = timeout` verbatim |
 
 ## Hướng khắc phục đề xuất
 

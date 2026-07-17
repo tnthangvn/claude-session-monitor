@@ -259,15 +259,15 @@ describe('decrypt compatibility + loadConfig', () => {
     });
   });
 
-  test('floors ttl to TTL_FLOOR_SEC when the configured timeout is smaller', () => {
+  test('honors the configured timeout verbatim as ttl (no hard floor)', () => {
     // Arrange
     config.saveConfig(runnerConfig({ timeout: 60 }));
 
     // Act
     const loaded = runner.loadConfig();
 
-    // Assert
-    expect(loaded.ttl).toBe(runner.TTL_FLOOR_SEC);
+    // Assert — ttl now tracks the config timeout exactly.
+    expect(loaded.ttl).toBe(60);
     expect(loaded.botToken).toBe(RUNNER_TOKEN);
   });
 });
@@ -566,72 +566,71 @@ describe('onSessionStart — lock check against the pinned state message', () =>
     expect(runner.readMarker(id).role).toBe('owner');
     expect(killSpy).not.toHaveBeenCalled();
     expect(sent('sendMessage')).toHaveLength(0); // not the first session → silent
-    // The refreshed state keeps BOTH sessions on this machine.
+    // Remote state is minimal {machine, mid, ts} — no per-session map. Both
+    // sessions live in the machine-local ACTIVE_DIR refcount instead.
     const written = JSON.parse(
       sent('editMessageText')[0].params.text.slice(
         sent('editMessageText')[0].params.text.indexOf('{')
       )
     );
-    expect(Object.keys(written.accounts[ACCOUNT].sessions).sort()).toEqual(
-      ['other-live', id].sort()
-    );
+    expect(written.accounts[ACCOUNT].sessions).toBeUndefined();
+    expect(written.accounts[ACCOUNT].machine).toBe(os.hostname());
+    expect(runner.localActiveCount(TTL)).toBe(2); // other-live + id
 
     runner.removeMarker(id);
   });
 
-  test('STALE lock from another machine (ts beyond ttl) → acquires, no kill', async () => {
-    // Arrange — the fake holder's ts expired: fail-open by design.
+  test('EXPIRED lock from another machine (past exp) → takes over with ♻️', async () => {
+    // Arrange — the fake holder is past its declared expiry (legacy ts beyond ttl).
     const id = freshSessionId();
     mockTelegram(pinnedChat(heldByOtherMachine(Math.floor(Date.now() / 1000) - TTL - 60)));
 
     // Act
     const rc = await runnerOnSessionStart({ session_id: id });
 
-    // Assert
+    // Assert — expired foreign holder → this machine takes over as owner.
     expect(rc).toBe(0);
     expect(runner.readMarker(id).role).toBe('owner');
     expect(killSpy).not.toHaveBeenCalled();
-    // First session on this machine → one ✅ notify + a state write.
     expect(sent('sendMessage')).toHaveLength(1);
-    expect(sent('sendMessage')[0].params.text).toContain('✅');
-    expect(sent('editMessageText')).toHaveLength(1);
-
-    runner.removeMarker(id);
-  });
-
-  test('STALE holder within ttl (no heartbeat > 10min) → takes over, no kill', async () => {
-    // Arrange — the holder is still inside the configured ttl (1800s) but has
-    // not been seen for longer than TTL_FLOOR_SEC (600s): a crashed/idle holder
-    // that never released. Re-entry must NOT SIGKILL this machine forever.
-    const staleAge = runner.TTL_FLOOR_SEC + 120; // > floor, still < ttl (1800)
-    const id = freshSessionId();
-    mockTelegram(pinnedChat(heldByOtherMachine(Math.floor(Date.now() / 1000) - staleAge)));
-
-    // Act
-    const rc = await runnerOnSessionStart({ session_id: id });
-
-    // Assert — this machine owns the lock now, nothing was killed.
-    expect(rc).toBe(0);
-    expect(runner.readMarker(id).role).toBe('owner');
-    expect(killSpy).not.toHaveBeenCalled();
-
-    // A takeover notice was sent and the state was rewritten to this machine,
-    // dropping the stale holder's sessions.
-    const notifies = sent('sendMessage');
-    expect(notifies).toHaveLength(1);
-    expect(notifies[0].params.text).toContain('♻️');
-    expect(notifies[0].params.text).toContain('may-gia-lap'); // the stale holder
+    expect(sent('sendMessage')[0].params.text).toContain('♻️'); // takeover notice
+    expect(sent('sendMessage')[0].params.text).toContain('may-gia-lap'); // expired holder
     const edits = sent('editMessageText');
     expect(edits).toHaveLength(1);
     const written = JSON.parse(edits[0].params.text.slice(edits[0].params.text.indexOf('{')));
     expect(written.accounts[ACCOUNT].machine).toBe(os.hostname());
-    expect(Object.keys(written.accounts[ACCOUNT].sessions)).toEqual([id]);
+    expect(written.accounts[ACCOUNT].sessions).toBeUndefined();
+    expect(Number.isFinite(written.accounts[ACCOUNT].exp)).toBe(true); // holder-declared expiry
 
-    // History recorded the takeover with the stale holder + age.
+    // History recorded the takeover.
     const rows = config.readHistory();
     const takeover = rows.reverse().find((r) => r.event === 'TAKEOVER');
     expect(takeover).toBeDefined();
-    expect(takeover.detail).toMatch(/^stale holder=may-gia-lap, age=\d+s$/);
+    expect(takeover.detail).toMatch(/^expired holder=may-gia-lap$/);
+
+    runner.removeMarker(id);
+  });
+
+  test('holder still within its declared window → conflict warning, NOT stolen', async () => {
+    // Arrange — a holder that has NOT expired (seen within its ttl). With no
+    // reader-side floor, an active holder is protected: this machine WARNS
+    // instead of stealing the lock (fixes early takeover across mismatched ttls).
+    const withinWindow = 660; // < ttl (1800) → still active
+    const id = freshSessionId();
+    mockTelegram(pinnedChat(heldByOtherMachine(Math.floor(Date.now() / 1000) - withinWindow)));
+
+    // Act
+    const rc = await runnerOnSessionStart({ session_id: id });
+
+    // Assert — conflict marker + ⚠️, holder state left untouched.
+    expect(rc).toBe(0);
+    expect(runner.readMarker(id).role).toBe('conflict');
+    expect(killSpy).not.toHaveBeenCalled();
+    const notifies = sent('sendMessage');
+    expect(notifies).toHaveLength(1);
+    expect(notifies[0].params.text).toContain('⚠️');
+    expect(notifies[0].params.text).toContain('may-gia-lap');
+    expect(sent('editMessageText')).toHaveLength(0); // read-only on conflict
 
     runner.removeMarker(id);
   });
@@ -710,7 +709,7 @@ describe('onSessionStart — lock check against the pinned state message', () =>
     expect(edit.message_id).toBe(555);
     const written = JSON.parse(edit.text.slice(edit.text.indexOf('{')));
     expect(written.accounts[ACCOUNT].machine).toBe(os.hostname());
-    expect(Object.keys(written.accounts[ACCOUNT].sessions)).toEqual([id]);
+    expect(written.accounts[ACCOUNT].sessions).toBeUndefined(); // minimal remote shape
     expect(sent('pinChatMessage')[0].params.message_id).toBe(555);
 
     runner.removeMarker(id);
@@ -1050,7 +1049,7 @@ describe('onPreToolUse — conflict reminders (notify-only spam guard)', () => {
     expect(edits).toHaveLength(1);
     const written = JSON.parse(edits[0].params.text.slice(edits[0].params.text.indexOf('{')));
     expect(written.accounts[ACCOUNT].machine).toBe(os.hostname());
-    expect(Object.keys(written.accounts[ACCOUNT].sessions)).toEqual([id]);
+    expect(written.accounts[ACCOUNT].sessions).toBeUndefined(); // minimal remote shape
 
     const notifies = sent('sendMessage');
     expect(notifies).toHaveLength(1);
@@ -1060,27 +1059,25 @@ describe('onPreToolUse — conflict reminders (notify-only spam guard)', () => {
     runner.removeMarker(id);
   });
 
-  test('holder went stale (no heartbeat > 10 min) → also takes over as owner', async () => {
-    // Arrange — the holder's ts is older than TTL_FLOOR_SEC.
+  test('holder EXPIRED (past its window) → conflicted session takes over as owner', async () => {
+    // Arrange — the holder is past its declared expiry (legacy ts beyond ttl).
     const id = freshSessionId();
     agedConflictMarker(id);
     mockTelegram(
-      pinnedChat(
-        heldByOtherMachine(Math.floor(Date.now() / 1000) - runner.TTL_FLOOR_SEC - 60)
-      )
+      pinnedChat(heldByOtherMachine(Math.floor(Date.now() / 1000) - 1800 - 60)) // past ttl (1800)
     );
 
     // Act
     const rc = await runner.onPreToolUse(runner.loadConfig(), { session_id: id });
 
-    // Assert — owner now; the stale holder's sessions were dropped.
+    // Assert — owner now; the expired holder's entry was replaced.
     expect(rc).toBe(0);
     expect(runner.readMarker(id).role).toBe('owner');
     const edits = sent('editMessageText');
     expect(edits).toHaveLength(1);
     const written = JSON.parse(edits[0].params.text.slice(edits[0].params.text.indexOf('{')));
     expect(written.accounts[ACCOUNT].machine).toBe(os.hostname());
-    expect(Object.keys(written.accounts[ACCOUNT].sessions)).toEqual([id]);
+    expect(written.accounts[ACCOUNT].sessions).toBeUndefined(); // minimal remote shape
 
     runner.removeMarker(id);
   });
@@ -1243,5 +1240,36 @@ describe('notify once per machine-active period (local refcount gate)', () => {
     await runner.onSessionStart(cfg, { session_id: b });
     expect(withEmoji('✅')).toHaveLength(2); // a genuinely new active period
     runner.removeMarker(b);
+  });
+});
+
+describe('exp-based freshness (holder-declared expiry)', () => {
+  test('expiryFor returns a future epoch in MILLISECONDS', () => {
+    const before = Date.now();
+    const exp = runner.expiryFor({ ttl: 3600 });
+    // ms (not seconds): ~now + 3.6M ms, and comfortably larger than a seconds value.
+    expect(exp).toBeGreaterThanOrEqual(before + 3600 * 1000);
+    expect(exp).toBeLessThan(before + 3600 * 1000 + 5000);
+  });
+
+  test('isActive uses exp when present (future = active, past = expired)', () => {
+    const cfg = { ttl: 1800 };
+    expect(runner.isActive({ exp: Date.now() + 60_000 }, cfg)).toBe(true);
+    expect(runner.isActive({ exp: Date.now() - 1 }, cfg)).toBe(false);
+    expect(runner.isActive(null, cfg)).toBe(false);
+  });
+
+  test('isActive falls back to legacy ts (seconds) against the reader ttl', () => {
+    const cfg = { ttl: 1800 };
+    const now = Math.floor(Date.now() / 1000);
+    expect(runner.isActive({ ts: now - 100 }, cfg)).toBe(true); // within ttl
+    expect(runner.isActive({ ts: now - 1900 }, cfg)).toBe(false); // beyond ttl
+  });
+
+  test('readPushTs/writePushTs roundtrip a machine-wide push timestamp', () => {
+    config.deleteConfig();
+    expect(runner.readPushTs()).toBe(0);
+    runner.writePushTs();
+    expect(runner.readPushTs()).toBeGreaterThan(0);
   });
 });

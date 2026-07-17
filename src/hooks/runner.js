@@ -59,6 +59,10 @@ const REMIND_PATH = path.join(CONFIG_DIR, '.remind');
 //     a single unlink so only ONE of N concurrent enders posts the 👋.
 const ACTIVE_DIR = path.join(CONFIG_DIR, 'active');
 const OPEN_NOTICE_PATH = path.join(CONFIG_DIR, '.opennotice');
+// Machine-wide throttle for remote `exp` refreshes: while several sessions are
+// live, only ONE of them pushes the pinned message per HEARTBEAT_SEC window
+// (they all extend the SAME account expiry, so one write per window is enough).
+const PUSHED_PATH = path.join(CONFIG_DIR, '.pushed');
 const NET_TIMEOUT_MS = 6000;
 const WATCHDOG_MS = 9000; // absolute cap so Claude is never blocked by a hang
 
@@ -106,9 +110,30 @@ function loadConfig() {
   return {
     botToken: decryptToken(parsed.botToken),
     groupId: String(parsed.groupId),
-    ttl: Math.max(timeout, TTL_FLOOR_SEC),
+    ttl: timeout, // honor the configured timeout verbatim (no hard floor)
     stateMessageId: parsed.stateMessageId || null,
   };
+}
+
+// Absolute expiry (epoch MILLISECONDS) a holder stamps on the pinned message so
+// any reader judges freshness by the HOLDER's timeout, not its own: exp is
+// `now + timeout`, and a reader treats the entry as active while `Date.now() <
+// exp`. Milliseconds so the stored number is a direct `new Date(exp)` timestamp.
+function expiryFor(cfg) {
+  return Date.now() + cfg.ttl * 1000;
+}
+
+/**
+ * Whether an account entry is still within its holder-declared window. Uses the
+ * absolute `exp` when present; falls back to the legacy `ts` (epoch seconds)
+ * judged against the reader's ttl so old pinned messages still resolve.
+ */
+function isActive(cur, cfg) {
+  if (!cur) return false;
+  const exp = Number(cur.exp);
+  if (Number.isFinite(exp)) return Date.now() < exp;
+  const ts = Number(cur.ts) || 0;
+  return ts > 0 && nowSec() - ts < cfg.ttl;
 }
 
 // Persist ONLY stateMessageId, preserving the encrypted token object untouched.
@@ -426,6 +451,25 @@ function writeRemindTs() {
   }
 }
 
+// Machine-wide "last remote exp refresh" timestamp (epoch seconds). Lets N live
+// sessions coalesce their heartbeat pushes into one editMessageText per window.
+function readPushTs() {
+  try {
+    return parseInt(fs.readFileSync(PUSHED_PATH, 'utf8'), 10) || 0;
+  } catch (_e) {
+    return 0;
+  }
+}
+
+function writePushTs() {
+  try {
+    fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(PUSHED_PATH, `${nowSec()}\n`, { mode: 0o600 });
+  } catch (_e) {
+    /* best-effort */
+  }
+}
+
 // --------------------------------------------------------------------------
 // machine-local session refcount + atomic open/close notification gate
 // --------------------------------------------------------------------------
@@ -568,16 +612,15 @@ async function onSessionStart(cfg, input) {
 
   const { state, messageId, pinned } = await readState(cfg);
   const cur = state.accounts[account];
-  const age = nowSec() - (Number(cur && cur.ts) || 0);
-  const active = cur && age < cfg.ttl;
+  const active = isActive(cur, cfg); // within the HOLDER-declared exp window?
   const ours = sameHolder(cur, machine, mid);
 
-  // A holder on a DIFFERENT machine (hostname OR public IP differs) is a LIVE
-  // conflict only while it has been seen recently (within TTL_FLOOR_SEC — long
-  // enough to cover a slow tool call). Past that, but still inside the
-  // configured ttl, the holder is treated as stale/dead: we re-check the
-  // pinned state and take the lock over here.
-  const liveConflict = active && !ours && age < TTL_FLOOR_SEC;
+  // A holder on a DIFFERENT machine that is still within its own declared expiry
+  // is a LIVE conflict. Once its `exp` has passed it is treated as free and this
+  // session takes the lock over. No reader-side floor: the holder's timeout —
+  // baked into `exp` — decides the window, so machines with different timeouts
+  // no longer disagree about when a lock is stale.
+  const liveConflict = active && !ours;
 
   // Conflict: same account, held by a DIFFERENT machine, still fresh.
   // Policy: NOTIFY-ONLY — the group gets a warning naming both machines, but
@@ -610,26 +653,21 @@ async function onSessionStart(cfg, input) {
     return 0;
   }
 
-  // Taking over a stale lock left by a DIFFERENT machine: don't inherit its
+  // Taking over an EXPIRED lock left by a DIFFERENT machine: don't inherit its
   // sessions, and announce the takeover so the group sees the machine change.
-  const staleHolder = active && !ours ? cur.machine : null;
+  const staleHolder = cur && !ours && !active ? cur.machine : null;
   if (staleHolder) {
-    appendHistory('TAKEOVER', `stale holder=${staleHolder}, age=${age}s`);
+    appendHistory('TAKEOVER', `expired holder=${staleHolder}`);
   }
 
-  // Free (or same machine) → acquire or join the lock. A stale holder on another
-  // machine is dropped (its sessions are not carried over).
-  const sessions = liveSessions(active && ours ? cur : null, cfg.ttl);
-  sessions[sessionId] = nowSec();
-
-  state.accounts[account] = {
-    machine,
-    mid,
-    sessions,
-    ts: nowSec(),
-  };
+  // Free (or same machine) → acquire or join the lock. The pinned message keeps
+  // only identity (mid) + display label (machine) + expiry (exp = now + timeout);
+  // the live session set is tracked locally (ACTIVE_DIR) so the message never
+  // grows with per-session UUIDs.
+  state.accounts[account] = { machine, mid, exp: expiryFor(cfg) };
   await writeState(cfg, state, messageId, !pinned);
   writeMarker(sessionId, 'owner');
+  writePushTs(); // this write is the latest remote refresh (heartbeats coalesce off it)
 
   // Notify ONCE per machine-active period. The local refcount is the source of
   // truth: register this session, then let exactly one concurrent starter win
@@ -663,10 +701,9 @@ async function onPreToolUse(cfg, input) {
       const mid = getMachineId();
       const { state, messageId, pinned } = await readState(cfg);
       const cur = state.accounts[account];
-      const age = nowSec() - (Number(cur && cur.ts) || 0);
       const ours = sameHolder(cur, machine, mid);
 
-      if (cur && !ours && age < TTL_FLOOR_SEC) {
+      if (cur && !ours && isActive(cur, cfg)) {
         // Still a live conflict. One reminder per machine per window: several
         // conflicted sessions here share the REMIND_PATH throttle.
         if (nowSec() - readRemindTs() >= CONFLICT_REMIND_SEC) {
@@ -680,19 +717,13 @@ async function onPreToolUse(cfg, input) {
           );
         }
       } else {
-        // The other machine released / went stale → this session takes the
-        // lock over and becomes a normal owner (reminders stop).
-        const sessions = liveSessions(cur && ours ? cur : null, cfg.ttl);
-        sessions[sessionId] = nowSec();
-        state.accounts[account] = {
-          machine,
-          mid,
-          sessions,
-          ts: nowSec(),
-        };
+        // The other machine's lock expired → this session takes it over and
+        // becomes a normal owner (reminders stop).
+        state.accounts[account] = { machine, mid, exp: expiryFor(cfg) };
         await writeState(cfg, state, messageId, !pinned);
         writeMarker(sessionId, 'owner');
         localActiveAdd(sessionId);
+        writePushTs();
         if (claimOpenNotice(cfg.ttl)) {
           appendHistory('START', '(after conflict)');
           await notify(
@@ -708,10 +739,15 @@ async function onPreToolUse(cfg, input) {
     return 0;
   }
 
-  // Owner → throttled remote heartbeat to keep the lock alive during long work.
+  // Owner → keep the lock alive during long work. The local marker + active file
+  // refresh every window (per-session, cheap); the REMOTE exp is refreshed at
+  // most once per window MACHINE-WIDE, so N live sessions coalesce into a single
+  // editMessageText instead of each re-writing the same expiry.
   if (m && m.role === 'owner' && nowSec() - m.ts >= HEARTBEAT_SEC) {
     writeMarker(sessionId, 'owner'); // refresh local ts first (fast)
     localActiveAdd(sessionId); // keep this session from being pruned as stale
+    if (nowSec() - readPushTs() < HEARTBEAT_SEC) return 0; // another session already pushed
+    writePushTs(); // claim this window; only this caller refreshes the remote exp
     try {
       const account = getAccount();
       const mid = getMachineId();
@@ -721,14 +757,8 @@ async function onPreToolUse(cfg, input) {
       // message): this session verifiably owns the lock (owner marker), so its
       // entry is rebuilt and the write below re-pins the state message.
       if (!cur || sameHolder(cur, getMachine(), mid)) {
-        const entry = cur || { machine: getMachine(), mid };
-        const sessions = liveSessions(cur, cfg.ttl);
-        sessions[sessionId] = nowSec(); // refresh (or revive) this session
-        entry.sessions = sessions;
-        delete entry.session; // drop the legacy single-session field
-        if (mid && !entry.mid) entry.mid = mid; // backfill mid on a legacy entry
-        entry.ts = nowSec();
-        state.accounts[account] = entry;
+        // Re-emit the minimal shape (also strips any legacy sessions/session/ip).
+        state.accounts[account] = { machine: getMachine(), mid, exp: expiryFor(cfg) };
         await writeState(cfg, state, messageId, !pinned);
       }
     } catch (_e) {
@@ -762,13 +792,10 @@ async function onSessionEnd(cfg, input) {
     const cur = state.accounts[account];
     if (!sameHolder(cur, machine, mid)) return 0; // lock no longer ours
 
-    const sessions = liveSessions(cur, cfg.ttl);
-    delete sessions[sessionId];
-
     if (stillActiveLocally) {
       // Other sessions on this machine are still open → keep the lock, no noti.
-      cur.sessions = sessions;
-      delete cur.session; // drop the legacy single-session field
+      // Extend the expiry and re-emit the minimal shape (strips legacy fields).
+      state.accounts[account] = { machine, mid, exp: expiryFor(cfg) };
       await writeState(cfg, state, messageId, !pinned);
       return 0;
     }
@@ -839,10 +866,13 @@ module.exports = {
   REMIND_PATH,
   ACTIVE_DIR,
   OPEN_NOTICE_PATH,
+  PUSHED_PATH,
   esc,
   markerPath,
   decryptToken,
   loadConfig,
+  expiryFor,
+  isActive,
   saveStateMessageId,
   getAccount,
   getMachine,
@@ -857,6 +887,8 @@ module.exports = {
   removeMarker,
   readRemindTs,
   writeRemindTs,
+  readPushTs,
+  writePushTs,
   localActiveAdd,
   localActiveRemove,
   localActiveCount,
